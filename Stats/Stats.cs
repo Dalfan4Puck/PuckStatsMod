@@ -2340,48 +2340,6 @@ namespace oomtm450PuckMod_Stats {
                                 // Period has changed - resolve any pending faceoff
                                 ResolvePendingFaceoffOnTrackingStop();
                                 Logging.Log($"Period transition detected: {_lastTrackedPeriod} -> {currentPeriod}. Resolved pending faceoff.", ServerConfig);
-                                
-                                // Record period end event at the exact end time of the previous period
-                                // Each period is 300 seconds, so period N ends at gameTime = N * 300
-                                float periodEndGameTime = _lastTrackedPeriod * 300f;
-                                
-                                // Create a period end event with roster data from the last event (if available)
-                                var periodEndEvent = new PlayByPlayEvent {
-                                    EventId = _nextPlayByPlayEventId++,
-                                    EventType = PlayByPlayEventType.PeriodEnd,
-                                    GameTime = periodEndGameTime,
-                                    Period = _lastTrackedPeriod,
-                                    PlayerSteamId = "",
-                                    PlayerName = "",
-                                    PlayerTeam = 0,
-                                    PlayerPosition = "",
-                                    PlayerJersey = 0,
-                                    PlayerSpeed = 0f,
-                                    Zone = EventZone.Neutral,
-                                    Position = Vector3.zero,
-                                    Velocity = Vector3.zero,
-                                    ForceMagnitude = 0f,
-                                    Outcome = "end",
-                                    Flags = "",
-                                    Team = "", // Period end has no team
-                                    TeamInPossession = _currentTeamInPossession != PlayerTeam.None ? (_currentTeamInPossession == PlayerTeam.Blue ? "Blue" : "Red") : "",
-                                    CurrentPlayInPossession = _currentPlayInPossession.ToString(),
-                                    ScoreState = GetScoreState(PlayerTeam.None),
-                                    Timestamp = DateTime.UtcNow
-                                };
-                                
-                                // Capture roster data from current game state if available
-                                CaptureTeamRosterData(periodEndEvent);
-                                
-                                // Insert the period end event at the correct chronological position
-                                int insertIndex = _playByPlayEvents.Count;
-                                for (int i = 0; i < _playByPlayEvents.Count; i++) {
-                                    if (_playByPlayEvents[i].GameTime >= periodEndGameTime) {
-                                        insertIndex = i;
-                                        break;
-                                    }
-                                }
-                                _playByPlayEvents.Insert(insertIndex, periodEndEvent);
                             }
                             _lastTrackedPeriod = currentPeriod;
                             
@@ -2444,55 +2402,65 @@ namespace oomtm450PuckMod_Stats {
                         _playersCurrentPuckTouch.Clear();
 
                         if (phase == GamePhase.GameOver) {
-                            // Record PeriodEnd event for the final period if it hasn't been recorded yet
-                            int finalPeriod = GetCurrentPeriod();
-                            if (finalPeriod > 0) {
-                                // Check if we already have a PeriodEnd event for this period
-                                bool hasPeriodEndEvent = _playByPlayEvents.Any(e => 
-                                    e.EventType == PlayByPlayEventType.PeriodEnd && e.Period == finalPeriod);
+                            // Record GameEnd event when game concludes
+                            // Check if we already have a GameEnd event
+                            bool hasGameEndEvent = _playByPlayEvents.Any(e => 
+                                e.EventType == PlayByPlayEventType.GameEnd);
+                            
+                            if (!hasGameEndEvent) {
+                                int finalPeriod = GetCurrentPeriod();
                                 
-                                if (!hasPeriodEndEvent) {
-                                    // Record period end event at the exact end time of the final period
-                                    float periodEndGameTime = finalPeriod * 300f;
-                                    
-                                    var periodEndEvent = new PlayByPlayEvent {
-                                        EventId = _nextPlayByPlayEventId++,
-                                        EventType = PlayByPlayEventType.PeriodEnd,
-                                        GameTime = periodEndGameTime,
-                                        Period = finalPeriod,
-                                        PlayerSteamId = "",
-                                        PlayerName = "",
-                                        PlayerTeam = 0,
-                                        PlayerPosition = "",
-                                        PlayerJersey = 0,
-                                        PlayerSpeed = 0f,
-                                        Zone = EventZone.Neutral,
-                                        Position = Vector3.zero,
-                                        Velocity = Vector3.zero,
-                                        ForceMagnitude = 0f,
-                                        Outcome = "end",
-                                        Flags = "",
-                                        Team = "", // Period end has no team
-                                        TeamInPossession = _currentTeamInPossession != PlayerTeam.None ? (_currentTeamInPossession == PlayerTeam.Blue ? "Blue" : "Red") : "",
-                                        CurrentPlayInPossession = _currentPlayInPossession.ToString(),
-                                        ScoreState = GetScoreState(PlayerTeam.None),
-                                        Timestamp = DateTime.UtcNow
-                                    };
-                                    
-                                    // Capture roster data from current game state if available
-                                    CaptureTeamRosterData(periodEndEvent);
-                                    
-                                    // Insert the period end event at the correct chronological position
-                                    int insertIndex = _playByPlayEvents.Count;
-                                    for (int i = 0; i < _playByPlayEvents.Count; i++) {
-                                        if (_playByPlayEvents[i].GameTime >= periodEndGameTime) {
-                                            insertIndex = i;
-                                            break;
-                                        }
-                                    }
-                                    _playByPlayEvents.Insert(insertIndex, periodEndEvent);
-                                    Logging.Log($"Recorded PeriodEnd event for period {finalPeriod} at game end.", ServerConfig);
+                                // If game ended in regulation (3 periods), use exactly 900.0
+                                // Otherwise, use the maximum gameTime from all events
+                                float gameEndGameTime;
+                                if (finalPeriod == 3) {
+                                    // Game ended in regulation - use exactly 900.0 seconds
+                                    gameEndGameTime = 900.0f;
                                 }
+                                else {
+                                    // Game went to overtime or ended early - use actual max gameTime
+                                    gameEndGameTime = _playByPlayEvents.Count > 0 
+                                        ? _playByPlayEvents.Max(e => e.GameTime) 
+                                        : GetCurrentGameTime();
+                                }
+                                
+                                var gameEndEvent = new PlayByPlayEvent {
+                                    EventId = _nextPlayByPlayEventId++,
+                                    EventType = PlayByPlayEventType.GameEnd,
+                                    GameTime = gameEndGameTime,
+                                    Period = finalPeriod,
+                                    PlayerSteamId = "",
+                                    PlayerName = "",
+                                    PlayerTeam = 0,
+                                    PlayerPosition = "",
+                                    PlayerJersey = 0,
+                                    PlayerSpeed = 0f,
+                                    Zone = EventZone.Neutral,
+                                    Position = Vector3.zero,
+                                    Velocity = Vector3.zero,
+                                    ForceMagnitude = 0f,
+                                    Outcome = "end",
+                                    Flags = "",
+                                    Team = "", // Game end has no team
+                                    TeamInPossession = _currentTeamInPossession != PlayerTeam.None ? (_currentTeamInPossession == PlayerTeam.Blue ? "Blue" : "Red") : "",
+                                    CurrentPlayInPossession = _currentPlayInPossession.ToString(),
+                                    ScoreState = GetScoreState(PlayerTeam.None),
+                                    Timestamp = DateTime.UtcNow
+                                };
+                                
+                                // Capture roster data from current game state if available
+                                CaptureTeamRosterData(gameEndEvent);
+                                
+                                // Insert the game end event at the correct chronological position
+                                int insertIndex = _playByPlayEvents.Count;
+                                for (int i = 0; i < _playByPlayEvents.Count; i++) {
+                                    if (_playByPlayEvents[i].GameTime >= gameEndGameTime) {
+                                        insertIndex = i;
+                                        break;
+                                    }
+                                }
+                                _playByPlayEvents.Insert(insertIndex, gameEndEvent);
+                                Logging.Log($"Recorded GameEnd event at gameTime {gameEndGameTime:F3} (period {finalPeriod}).", ServerConfig);
                             }
                             
                             string gwgSteamId = "";
@@ -3844,32 +3812,19 @@ namespace oomtm450PuckMod_Stats {
             }
             
             // Handle players still on ice at the end of the game
-            // Check if game ended in regular time (exactly 3 periods) - if so, use PeriodEnd event's GameTime (900.0)
-            // If game went to overtime (maxPeriod > 3), use the max GameTime from all events
-            int maxPeriod = sortedEvents
-                .Where(e => e.EventType == PlayByPlayEventType.PeriodEnd)
-                .Select(e => e.Period)
-                .DefaultIfEmpty(0)
-                .Max();
+            // Look for GameEnd event first, if not found use the maximum gameTime from all events
+            var gameEndEvent = sortedEvents
+                .Where(e => e.EventType == PlayByPlayEventType.GameEnd)
+                .OrderByDescending(e => e.GameTime)
+                .FirstOrDefault();
             
             float finalGameTime;
-            if (maxPeriod == 3) {
-                // Game ended in regular time (exactly 3 periods) - use PeriodEnd event's GameTime (900.0)
-                var period3EndEvent = sortedEvents
-                    .Where(e => e.EventType == PlayByPlayEventType.PeriodEnd && e.Period == 3)
-                    .OrderByDescending(e => e.GameTime)
-                    .FirstOrDefault();
-                
-                if (period3EndEvent != null) {
-                    finalGameTime = period3EndEvent.GameTime;
-                }
-                else {
-                    // Fallback: use 900.0 if PeriodEnd event not found but maxPeriod is 3
-                    finalGameTime = 900.0f;
-                }
+            if (gameEndEvent != null) {
+                // Use GameEnd event's GameTime
+                finalGameTime = gameEndEvent.GameTime;
             }
             else {
-                // Game went to overtime (maxPeriod > 3) or didn't complete - use the maximum game time from all events
+                // Fallback: use the maximum game time from all events if GameEnd doesn't exist
                 finalGameTime = sortedEvents.Count > 0 ? sortedEvents.Max(e => e.GameTime) : 0f;
             }
             
@@ -8770,16 +8725,9 @@ namespace oomtm450PuckMod_Stats {
                 int blueFaceoffTotal = _teamFaceoffTotal.TryGetValue(PlayerTeam.Blue, out int bft) ? bft : 0;
                 int redFaceoffTotal = _teamFaceoffTotal.TryGetValue(PlayerTeam.Red, out int rft) ? rft : 0;
                 
+                // Calculate actual game time from events (not hardcoded)
+                // This reflects the true game duration, including early endings (forfeits)
                 float totalGameTimeSeconds = _playByPlayEvents.Count > 0 ? _playByPlayEvents.Max(e => e.GameTime) : 0f;
-                int maxPeriod = _playByPlayEvents
-                    .Where(e => e.EventType == PlayByPlayEventType.PeriodEnd)
-                    .Select(e => e.Period)
-                    .DefaultIfEmpty(0)
-                    .Max();
-                
-                if (maxPeriod == 3) {
-                    totalGameTimeSeconds = 900.0f;
-                }
                 
                 double totalGameTimeMinutes = totalGameTimeSeconds / 60.0;
                 
@@ -8979,8 +8927,8 @@ namespace oomtm450PuckMod_Stats {
                     return "dzexit";
                 case PlayByPlayEventType.OZEntry:
                     return "ozentry";
-                case PlayByPlayEventType.PeriodEnd:
-                    return "periodend";
+                case PlayByPlayEventType.GameEnd:
+                    return "gameend";
                 default:
                     return "touch";
             }
@@ -9861,7 +9809,7 @@ namespace oomtm450PuckMod_Stats {
             FaceoffOutcome,
             DZExit,
             OZEntry,
-            PeriodEnd
+            GameEnd
         }
 
         /// <summary>
