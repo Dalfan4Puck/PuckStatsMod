@@ -1,0 +1,26 @@
+################################################################################
+# Ce fichier .gitignore a été automatiquement créé par Microsoft(R) Visual Studio.
+################################################################################
+
+/.vs
+/Ruleset/obj
+/Ruleset/bin
+/Codebase/obj/x86/Debug
+/Stats/.vs
+/Stats/obj/
+/Stats/libs/
+/Stats/bin/Release
+/Stats/bin/Release
+/packages/Newtonsoft.Json.13.0.4
+/Sounds/obj/Release
+/Sounds/bin/Release
+/SoundsPack/.vs
+/SoundsPack/bin/Release
+/SoundsPack/obj/Release
+
+# Deployment and server-specific files
+DEPLOYMENT_GUIDE.md
+restart-server.ps1
+server_configuration.json
+oomtm450_stats_serverconfig.json
+Stats/obj/
