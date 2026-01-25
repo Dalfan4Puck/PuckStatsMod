@@ -58,6 +58,11 @@ namespace oomtm450PuckMod_Stats.Configs {
         public string FileHeaderName { get; set; } = "puck";
 
         /// <summary>
+        /// Bool, if true, enables the 8 player 300 event limit for exports. If false, exports will happen regardless of player/event count (debug mode).
+        /// </summary>
+        public bool EnableExportLimit { get; set; } = true;
+
+        /// <summary>
         /// String, name of the mod.
         /// </summary>
         [JsonIgnore]

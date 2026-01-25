@@ -53,6 +53,9 @@ Each player object contains the following fields:
 - **`faceoffWins`** (int): Faceoffs won
 - **`faceoffLosses`** (int): Faceoffs lost
 
+#### Skaters Only (additional fields)
+- **`plusMinus`** (int): Plus/minus rating (+1 for goals scored by team, -1 for goals allowed)
+
 #### Goalies Only (additional fields)
 - **`shotsFaced`** (int): Total shots faced
 - **`saves`** (int): Total saves made
