@@ -4,7 +4,7 @@ using Newtonsoft.Json;
 using System;
 using System.IO;
 
-namespace oomtm450PuckMod_Stats.Configs {
+namespace StatsTooltip.Configs {
     /// <summary>
     /// Class containing the configuration from oomtm450_stats_serverconfig.json used for this mod.
     /// </summary>
@@ -53,7 +53,14 @@ namespace oomtm450PuckMod_Stats.Configs {
         public int MaxPossessionMilliseconds { get; set; } = 700;
 
         /// <summary>
+        /// Bool, if true the FileHeaderName below is used as-is for file naming instead of being
+        /// derived automatically from the server name. Default false (auto-derive from server name).
+        /// </summary>
+        public bool UseCustomFileHeaderName { get; set; } = false;
+
+        /// <summary>
         /// String, header name used for JSON and CSV file naming.
+        /// Only applied when UseCustomFileHeaderName is true; otherwise derived from the server name.
         /// </summary>
         public string FileHeaderName { get; set; } = "puck";
 
@@ -102,9 +109,11 @@ namespace oomtm450PuckMod_Stats.Configs {
             if (MaxPossessionMilliseconds == _oldConfig.MaxPossessionMilliseconds)
                 MaxPossessionMilliseconds = newConfig.MaxPossessionMilliseconds;
 
-            // FileHeaderName is new, so use default if not set
+            // FileHeaderName / UseCustomFileHeaderName are new fields — keep defaults if unset
             if (string.IsNullOrEmpty(FileHeaderName))
                 FileHeaderName = newConfig.FileHeaderName;
+            if (UseCustomFileHeaderName == _oldConfig.UseCustomFileHeaderName)
+                UseCustomFileHeaderName = newConfig.UseCustomFileHeaderName;
         }
 
         /// <summary>

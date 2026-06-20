@@ -1,4 +1,4 @@
-namespace oomtm450PuckMod_Stats {
+namespace StatsTooltip {
     /// <summary>
     /// Class containing some constants linked to the mod in general.
     /// </summary>
@@ -6,7 +6,12 @@ namespace oomtm450PuckMod_Stats {
         /// <summary>
         /// Const string, name of the mod on the workshop.
         /// </summary>
-        internal const string WORKSHOP_MOD_NAME = "Stats";
+        internal const string WORKSHOP_MOD_NAME = "StatsTooltip";
+
+        /// <summary>
+        /// Const string, URL to the mod's Steam Workshop page.
+        /// </summary>
+        internal const string WORKSHOP_URL = "https://steamcommunity.com/sharedfiles/filedetails/?id=3608968085";
 
         /// <summary>
         /// Const string, name of the mod.

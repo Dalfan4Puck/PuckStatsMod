@@ -1,6 +1,6 @@
 using Codebase.Configs;
 
-namespace oomtm450PuckMod_Stats.Configs {
+namespace StatsTooltip.Configs {
     /// <summary>
     /// Class containing the old configuration from oomtm450_stats_serverconfig.json used for this mod.
     /// </summary>
@@ -40,6 +40,11 @@ namespace oomtm450PuckMod_Stats.Configs {
         /// Int, number of milliseconds for a possession to be considered without challenging.
         /// </summary>
         public int MaxPossessionMilliseconds { get; } = 700;
+
+        /// <summary>
+        /// Bool, whether to use a custom file header name (not in old config).
+        /// </summary>
+        public bool UseCustomFileHeaderName { get; } = false;
 
         /// <summary>
         /// String, header name used for JSON and CSV file naming (not in old config).

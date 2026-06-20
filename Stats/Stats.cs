@@ -1,7 +1,24 @@
+﻿// -----------------------------------------------------------------------------
+// DEBUG MODE — comment out for production builds.
+//   Server: appends stats_debug_server.txt to the ./stats/ folder.
+//   Client: appends stats_debug_client.txt to Application.persistentDataPath.
+// -----------------------------------------------------------------------------
+// #define DEBUG_MODE
+
+// -----------------------------------------------------------------------------
+// API DUMP — enable to write puck_api_dump.txt on first server start.
+// Reflects every loaded assembly at runtime and dumps types/methods/fields so
+// broken API references can be identified after a game update.
+// Comment out after grabbing the dump file.
+// -----------------------------------------------------------------------------
+// #define PUCK_API_DUMP
+
     using Codebase;
 using HarmonyLib;
 using Newtonsoft.Json;
-using oomtm450PuckMod_Stats.Configs;
+using StatsTooltip.Configs;
+// Alias to disambiguate from the game's global ServerConfig struct
+using ModServerConfig = StatsTooltip.Configs.ServerConfig;
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
@@ -9,34 +26,26 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Text;
 using Unity.Netcode;
 using UnityEngine;
 using UnityEngine.UIElements;
 
-namespace oomtm450PuckMod_Stats {
-    public class Stats : IPuckMod {
+namespace StatsTooltip {
+    public class Stats : IPuckPlugin {
         #region Constants
         /// <summary>
         /// Const string, version of the mod.
         /// </summary>
-        private static readonly string MOD_VERSION = "0.6.0";
+        private static readonly string MOD_VERSION = "1.31";
 
         /// <summary>
-        /// List of string, last released versions of the mod.
+        /// The client version the server requires. Sent to each connecting client so it can
+        /// compare against its own MOD_VERSION and notify the user if out of date.
+        /// Bump this whenever a client update is mandatory/recommended.
         /// </summary>
-        private static readonly ReadOnlyCollection<string> OLD_MOD_VERSIONS = new ReadOnlyCollection<string>(new List<string> {
-            "0.1.0",
-            "0.1.1",
-            "0.1.2",
-            "0.2.0",
-            "0.2.1",
-            "0.2.2",
-            "0.3.0",
-            "0.4.0",
-            "0.4.1",
-            "0.5.0",
-        });
+        private static readonly string COMPATIBLE_CLIENT_VERSION = "1.31";
 
         /// <summary>
         /// ReadOnlyCollection of string, collection of datanames to not log.
@@ -157,9 +166,25 @@ namespace oomtm450PuckMod_Stats {
         /// </summary>
         private const string STAR = Constants.MOD_NAME + "STAR";
 
+        private const string MEDAL_GOLD = "\U0001F947";
+        private const string MEDAL_SILVER = "\U0001F948";
+        private const string MEDAL_BRONZE = "\U0001F949";
+
+        /// <summary>White star (U+2B50) for scoreboard rich-text; medal emoji often fails in UITK labels.</summary>
+        private const string STAR_GLYPH = "\u2B50";
+
+        private static string GetStarMedalGlyph(int starKey) {
+            if (starKey == 1) return MEDAL_GOLD;
+            if (starKey == 2) return MEDAL_SILVER;
+            if (starKey == 3) return MEDAL_BRONZE;
+            return "";
+        }
+
         private const string SOG_HEADER_LABEL_NAME = "SOGHeaderLabel";
 
         private const string SOG_LABEL = "SOGLabel";
+
+        private const string SOG_CELL_NAME = "SOGCell";
 
         private const string HIT_HEADER_LABEL_NAME = "HitHeaderLabel";
 
@@ -177,9 +202,9 @@ namespace oomtm450PuckMod_Stats {
         #region Fields and Properties
         // Server-side.
         /// <summary>
-        /// ServerConfig, config set and sent by the server.
+        /// ModServerConfig, config set and sent by the server.
         /// </summary>
-        internal static ServerConfig ServerConfig { get; set; } = new ServerConfig();
+        internal static ModServerConfig ModServerConfig { get; set; } = new ModServerConfig();
 
         private static bool? _rulesetModEnabled = null;
 
@@ -197,9 +222,17 @@ namespace oomtm450PuckMod_Stats {
         private static readonly LockDictionary<ulong, string> _players_ClientId_SteamId = new LockDictionary<ulong, string>();
 
         /// <summary>
-        /// LockDictionary of ulong and DateTime, last time a mod out of date message was sent to a client (ulong clientId).
+        /// Clients whose mod version didn't match COMPATIBLE_CLIENT_VERSION at connect time.
+        /// Keyed by clientId, value is the client's reported version string.
+        /// Broadcast is deferred until Event_OnPlayerRoleChanged so the player's name is populated.
         /// </summary>
-        private static readonly LockDictionary<ulong, DateTime> _sentOutOfDateMessage = new LockDictionary<ulong, DateTime>();
+        private static readonly LockDictionary<ulong, string> _pendingVersionMismatch = new LockDictionary<ulong, string>();
+
+        /// <summary>
+        /// Last MOD_VERSION reported by each client via ASK_SERVER_FOR_STARTUP_DATA.
+        /// </summary>
+        private static readonly LockDictionary<ulong, string> _clientReportedModVersions = new LockDictionary<ulong, string>();
+
 
 
         private static readonly LockDictionary<PlayerTeam, SaveCheck> _checkIfPuckWasSaved = new LockDictionary<PlayerTeam, SaveCheck> {
@@ -215,6 +248,16 @@ namespace oomtm450PuckMod_Stats {
         private static readonly LockDictionary<PlayerTeam, bool> _lastShotWasCounted = new LockDictionary<PlayerTeam, bool> {
             { PlayerTeam.Blue, true },
             { PlayerTeam.Red, true },
+        };
+
+        /// <summary>
+        /// Guards against SendSavePercDuringGoal firing twice for the same goal
+        /// (once from the Harmony Prefix patch, once from Event_OnStatsTrigger SOG path).
+        /// Reset to false whenever a new shot cycle begins (_lastShotWasCounted reset path).
+        /// </summary>
+        private static readonly LockDictionary<PlayerTeam, bool> _savePercDuringGoalProcessed = new LockDictionary<PlayerTeam, bool> {
+            { PlayerTeam.Blue, false },
+            { PlayerTeam.Red, false },
         };
 
         private static readonly LockDictionary<PlayerTeam, bool> _lastBlockWasCounted = new LockDictionary<PlayerTeam, bool> {
@@ -277,6 +320,9 @@ namespace oomtm450PuckMod_Stats {
         /// Bool, true if the mod has been patched in.
         /// </summary>
         private static bool _harmonyPatched = false;
+
+        /// <summary>Original methods patched on enable — used for safe per-target unpatch on disable.</summary>
+        private static readonly List<MethodBase> _harmonyPatchTargets = new List<MethodBase>();
 
         /// <summary>
         /// Bool, true if the mod has registered with the named message handler for server/client communication.
@@ -411,6 +457,40 @@ namespace oomtm450PuckMod_Stats {
         private static PlayerTeam _faceoffPossessionTeam = PlayerTeam.None;
         private static int _lastFaceoffEventId = -1;
         private static GamePhase _lastRecordedPhase = GamePhase.None;
+        // Deduplication guard for goal recording ? Server_NotifyGoalScoredRpc can fire
+        // multiple times (once per connected client) for a single goal event.
+        private static float _lastGoalDedupeTime = -1f;
+        private static string _lastGoalDedupeSteamId = null;
+        private static int _lastGoalDedupePeriod = -1;
+        /// <summary>True when we already exported at GameOver (so Warmup block can skip to avoid double-export).</summary>
+        // Two separate flags govern the GameOver → Warmup export handoff.
+        //
+        // _gameOverBlockEntered: set to true the FIRST time the GameOver branch runs for a given game.
+        //   The game-state event fires on every engine tick while the podium/GameOver screen is showing,
+        //   so without this guard the export and chat message would repeat on every tick.
+        //   Crucially, it is set at the TOP of the else-block (before any work), so even if an exception
+        //   occurs mid-block, subsequent ticks are still blocked and we don't spam partial exports.
+        //   Reset to false in the Warmup handler so it's ready for the next game.
+        //
+        // _exportedAtGameOver: set to true only AFTER ExportGameStats() actually succeeds for a
+        //   qualifying game. The Warmup fallback checks this flag: if true, Warmup skips its own
+        //   export (the game was already exported at GameOver). If false (criteria weren't met, or an
+        //   exception prevented the export), Warmup still tries its fallback export path.
+        //   Reset to false in the Warmup handler so it's ready for the next game.
+        //
+        // NOTE: Previously, the guard used `_lastRecordedPhase == GamePhase.GameOver` instead of
+        //   _gameOverBlockEntered. That was broken: _lastRecordedPhase is set to GameOver in the
+        //   outer else-branch (line ~2560) BEFORE the guard is evaluated, so the guard was always
+        //   true on the very first tick and the entire GameOver export block was permanently dead.
+        //   All exports were silently falling through to the Warmup fallback, which announced
+        //   correctly most of the time but was gated on `GameManager.Instance != null` — causing
+        //   silent (no chat) exports whenever GameManager was null at the Warmup transition.
+        private static bool _gameOverBlockEntered = false;
+        private static bool _exportedAtGameOver    = false;
+        /// <summary>True when we exported in ResetGameState Prefix (before stats were cleared). Prevents Warmup block from re-exporting.</summary>
+        private static bool _exportedAtResetGameState = false;
+        /// <summary>Suppress Puck's "Unknown command" for mod slash commands (may arrive async after the RPC).</summary>
+        private static float _suppressUnknownChatCommandUntil = 0f;
         private static bool _faceoffRecordedForCurrentPeriod = false;
         private static bool _faceoffTotalIncremented = false; // Track if total has been incremented for current faceoff
         private static int _lastTrackedPeriod = 0; // Track previous period to detect period transitions
@@ -435,15 +515,6 @@ namespace oomtm450PuckMod_Stats {
         /// </summary>
         private static bool _serverHasResponded = false;
 
-        /// <summary>
-        /// Bool, true if the client asked to be kicked because of versionning problems.
-        /// </summary>
-        private static bool _askForKick = false;
-
-        /// <summary>
-        /// Bool, true if the client needs to notify the user that the server is running an out of date version of the mod.
-        /// </summary>
-        private static bool _addServerModVersionOutOfDateMessage = false;
 
         /// <summary>
         /// Int, number of time client asked the server for startup data.
@@ -452,15 +523,32 @@ namespace oomtm450PuckMod_Stats {
 
         private static readonly List<string> _hasUpdatedUIScoreboard = new List<string>();
         private static bool _teamTooltipsSetup = false;
+        /// <summary>True while a deferred SetupTeamTooltips callback is queued (avoids stacking retries).</summary>
+        private static bool _teamTooltipSetupScheduled = false;
 
         private static readonly LockDictionary<string, Label> _sogLabels = new LockDictionary<string, Label>();
 
         private static readonly LockDictionary<string, VisualElement> _playerTooltips = new LockDictionary<string, VisualElement>();
         private static readonly LockDictionary<PlayerTeam, VisualElement> _teamTooltips = new LockDictionary<PlayerTeam, VisualElement>();
+        private static readonly LockDictionary<PlayerTeam, VisualElement> _teamHitAreas = new LockDictionary<PlayerTeam, VisualElement>();
         private static readonly LockDictionary<string, Label> _playerTooltipNameLabels = new LockDictionary<string, Label>();
         private static readonly LockDictionary<string, VisualElement> _playerTooltipContainers = new LockDictionary<string, VisualElement>();
         private static readonly LockDictionary<string, bool> _playerTooltipIsGoalie = new LockDictionary<string, bool>();
-        
+
+        private static bool _scoreboardColumnSyncRegistered;
+        private static VisualElement _sogColHeaderRow;
+        private static readonly HashSet<string> _sogHoverCallbacksRegistered = new HashSet<string>();
+        private sealed class PlayerTooltipPointerHandlers {
+            internal EventCallback<PointerEnterEvent> Enter;
+            internal EventCallback<PointerLeaveEvent> Leave;
+        }
+
+        private static readonly Dictionary<string, PlayerTooltipPointerHandlers> _playerTooltipPointerHandlers =
+            new Dictionary<string, PlayerTooltipPointerHandlers>();
+
+        /// <summary>Minimum width so goalie save % (e.g. 87.5%) fits in the stat column.</summary>
+        private const float SOG_COLUMN_MIN_WIDTH = 44f;
+
         /// <summary>
         /// Dictionary mapping tooltip VisualElements to their last mouse move time for throttling.
         /// </summary>
@@ -489,6 +577,9 @@ namespace oomtm450PuckMod_Stats {
         // Stat update batching system
         private static readonly LockDictionary<string, string> _pendingStatUpdates = new LockDictionary<string, string>();
         private static DateTime _lastStatBatchSendTime = DateTime.UtcNow;
+        /// <summary>Throttles expensive play-by-play scans in Server_Tick (matches PuckRaycast CHECK_EVERY_X_FRAMES).</summary>
+        private static int _serverPlayLogicTick = 0;
+        private const int SERVER_PLAY_LOGIC_EVERY_N_TICKS = 6;
         
         // Circuit breaker for batching failures - prevents server crashes
         private static int _batchingFailureCount = 0;
@@ -501,6 +592,77 @@ namespace oomtm450PuckMod_Stats {
         private const double STAT_BATCH_INTERVAL_SECONDS = 5.0;
         #endregion
 
+        // =====================================================================
+        // DEBUG TRACE SYSTEM
+        // Enabled by #define DEBUG_MODE at the top of the file.
+        // Server trace ? ./stats/stats_debug_server.txt
+        // Client trace ? {Application.persistentDataPath}/stats_debug_client.txt
+        // =====================================================================
+#if DEBUG_MODE
+        private static class DebugTrace {
+            private static readonly System.Text.StringBuilder _buf = new System.Text.StringBuilder(8192);
+            private static readonly object _lock = new object();
+            private static DateTime _startTime = DateTime.UtcNow;
+            private static string _filePath = null;
+            private static bool _isServer;
+            private static int _lineCount = 0;
+
+            public static void Init(bool isServer) {
+                _isServer = isServer;
+                _startTime = DateTime.UtcNow;
+                _lineCount = 0;
+                try {
+                    if (isServer) {
+                        string dir = Path.Combine(Path.GetFullPath("."), "stats");
+                        Directory.CreateDirectory(dir);
+                        _filePath = Path.Combine(dir, "stats_debug_server.txt");
+                    } else {
+                        // Write to AppData\Local ? always writable without admin rights.
+                        string dir = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+                        dir = Path.Combine(dir, "Puck");
+                        Directory.CreateDirectory(dir);
+                        _filePath = Path.Combine(dir, "stats_debug_client.txt");
+                    }
+                    // Truncate the file fresh each run
+                    File.WriteAllText(_filePath,
+                        $"========================================\r\n" +
+                        $"  STATS MOD DEBUG TRACE ? {(isServer ? "SERVER" : "CLIENT")}\r\n" +
+                        $"  Started : {_startTime:yyyy-MM-dd HH:mm:ss} UTC\r\n" +
+                        $"  Version : {MOD_VERSION}\r\n" +
+                        $"========================================\r\n\r\n");
+                } catch { /* if path fails we still buffer in memory */ }
+            }
+
+            /// <summary>Write one trace line.  section = "LIFECYCLE", "NETWORK", "SCOREBOARD", etc.</summary>
+            public static void Write(string section, string message) {
+                string elapsed = (DateTime.UtcNow - _startTime).ToString(@"hh\:mm\:ss\.fff");
+                string line = $"[{elapsed}] [{section,-14}] {message}";
+                lock (_lock) {
+                    _buf.AppendLine(line);
+                    _lineCount++;
+                    if (_lineCount % 20 == 0) Flush();    // flush every 20 lines
+                }
+            }
+
+            /// <summary>Flush the in-memory buffer to the trace file.</summary>
+            public static void Flush() {
+                lock (_lock) {
+                    if (_buf.Length == 0 || _filePath == null) return;
+                    try {
+                        File.AppendAllText(_filePath, _buf.ToString());
+                        _buf.Clear();
+                    } catch { }
+                }
+            }
+
+            /// <summary>Write a section separator to make the file easier to scan.</summary>
+            public static void Section(string title) {
+                string line = $"\r\n--- {title} {new string('-', Math.Max(0, 50 - title.Length))} [{DateTime.UtcNow:HH:mm:ss}]\r\n";
+                lock (_lock) { _buf.AppendLine(line); }
+            }
+        }
+#endif
+
         #region Harmony Patches
         /// <summary>
         /// Class that patches the Server_SpawnPuck event from PuckManager.
@@ -508,17 +670,17 @@ namespace oomtm450PuckMod_Stats {
         [HarmonyPatch(typeof(PuckManager), nameof(PuckManager.Server_SpawnPuck))]
         public class PuckManager_Server_SpawnPuck_Patch {
             [HarmonyPostfix]
-            public static void Postfix(ref Puck __result, Vector3 position, Quaternion rotation, Vector3 velocity, bool isReplay) {
+            public static void Postfix(ref Puck __result, Vector3 position, Quaternion rotation, bool isReplay) {
                 try {
                     // If this is not the server or this is a replay or game is not started, do not use the patch.
-                    if (!ServerFunc.IsDedicatedServer() || isReplay || (GameManager.Instance.Phase != GamePhase.Playing && GameManager.Instance.Phase != GamePhase.FaceOff))
+                    if (!ServerFunc.IsDedicatedServer() || isReplay || (GameManager.Instance.Phase != GamePhase.Play && GameManager.Instance.Phase != GamePhase.FaceOff))
                         return;
 
                     __result.gameObject.AddComponent<PuckRaycast>();
                     _puckRaycast = __result.gameObject.GetComponent<PuckRaycast>();
                     
                     // Record Faceoff event when puck spawns (only once per period/game start)
-                    if (!isReplay && GameManager.Instance != null && GameManager.Instance.Phase == GamePhase.Playing && !_faceoffRecordedForCurrentPeriod) {
+                    if (!isReplay && GameManager.Instance != null && GameManager.Instance.Phase == GamePhase.Play && !_faceoffRecordedForCurrentPeriod) {
                         // Clear any pending outcomes from previous faceoff
                         _pendingBlueFaceoffOutcome = null;
                         _pendingRedFaceoffOutcome = null;
@@ -534,18 +696,22 @@ namespace oomtm450PuckMod_Stats {
                     }
                 }
                 catch (Exception ex) {
-                    Logging.LogError($"Error in PuckManager_Server_SpawnPuck_Patch Postfix().\n{ex}", ServerConfig);
+                    Logging.LogError($"Error in PuckManager_Server_SpawnPuck_Patch Postfix().\n{ex}", ModServerConfig);
                 }
             }
         }
 
         /// <summary>
-        /// Class that patches the Server_GoalScored event from GameManager.
+        /// Class that patches the Server_NotifyGoalScoredRpc event from GameManager.
         /// </summary>
-        [HarmonyPatch(typeof(GameManager), nameof(GameManager.Server_GoalScored))]
+        [HarmonyPatch(typeof(GameManager), nameof(GameManager.Server_NotifyGoalScoredRpc))]
         public class GameManager_Server_GoalScored_Patch {
             [HarmonyPrefix]
-            public static bool Prefix(PlayerTeam team, ref Player lastPlayer, ref Player goalPlayer, ref Player assistPlayer, ref Player secondAssistPlayer, Puck puck) {
+            public static bool Prefix(PlayerTeam byTeam,
+                NetworkObjectReference goalPlayerNetworkObjectReference,
+                NetworkObjectReference assistPlayerNetworkObjectReference,
+                NetworkObjectReference secondAssistPlayerNetworkObjectReference,
+                NetworkObjectReference puckNetworkObjectReference) {
                 try {
                     // If this is not the server or game is not started, do not use the patch.
                     if (!ServerFunc.IsDedicatedServer() || RulesetModEnabled() || !_logic)
@@ -553,46 +719,71 @@ namespace oomtm450PuckMod_Stats {
 
                     // Reset own goal flag
                     _isCurrentGoalOwnGoal = false;
-                    
+
+                    // Resolve goal player from NetworkObjectReference
+                    Player goalPlayer = NetworkingUtils.GetPlayerFromNetworkObjectReference(goalPlayerNetworkObjectReference);
+
                     if (goalPlayer != null) {
                         // Normal goal - offensive player got credit
-                        // Use base game's goal detection (don't override)
-                        SendSavePercDuringGoal(team, SendSOGDuringGoal(goalPlayer));
+                        SendSavePercDuringGoal(byTeam, SendSOGDuringGoal(goalPlayer));
                         return true;
                     }
 
-                    // Own goal - no offensive player got credit (goalPlayer was null)
+                    // Own goal - no offensive player got credit (goalPlayer reference was empty)
                     _isCurrentGoalOwnGoal = true;
                     // For own goals, the player who last touched the puck is from the defending team (the team that got scored on)
-                    PlayerTeam defendingTeam = TeamFunc.GetOtherTeam(team);
-                    Player lastTouchPlayer = PlayerManager.Instance.GetPlayers().Where(x => x.SteamId.Value.ToString() == _lastPlayerOnPuckTipIncludedSteamId[defendingTeam].SteamId).FirstOrDefault();
-                    
+                    PlayerTeam defendingTeam = TeamFunc.GetOtherTeam(byTeam);
+                    Player lastTouchPlayer = PlayerManager.Instance.GetPlayerBySteamId(_lastPlayerOnPuckTipIncludedSteamId[defendingTeam].SteamId);
+
                     if (lastTouchPlayer != null) {
-                        UIChat.Instance.Server_SendSystemChatMessage($"OWN GOAL BY {lastTouchPlayer.Username.Value}");
-                        lastPlayer = lastTouchPlayer;
-                        // Don't set goalPlayer for own goals - it should remain null
+                        // Server_NotifyGoalScoredRpc fires once per connected client — only announce once.
+                        float currentGameTime = GetCurrentGameTime();
+                        int currentPeriod = GetCurrentPeriod();
+                        string ownGoalKey = lastTouchPlayer.SteamId.Value.Value;
+                        bool isDuplicateOwnGoal = ownGoalKey == _lastGoalDedupeSteamId
+                            && currentPeriod == _lastGoalDedupePeriod
+                            && Math.Abs(currentGameTime - _lastGoalDedupeTime) < 1.0f;
+
+                        if (!isDuplicateOwnGoal) {
+                            NetworkBehaviourSingleton<ChatManager>.Instance.Server_BroadcastChatMessage($"OWN GOAL BY {lastTouchPlayer.Username.Value}");
+                        }
                         // Don't call SendSOGDuringGoal for own goals - they shouldn't count as shots on goal
                     }
 
                     // Still need to update save percentage for the goalie (they didn't save it)
-                    SendSavePercDuringGoal(team, false);
+                    SendSavePercDuringGoal(byTeam, false);
                 }
                 catch (Exception ex) {
-                    Logging.LogError($"Error in GameManager_Server_GoalScored_Patch Prefix().\n{ex}", ServerConfig);
+                    Logging.LogError($"Error in GameManager_Server_GoalScored_Patch Prefix().\n{ex}", ModServerConfig);
                 }
 
                 return true;
             }
 
             [HarmonyPostfix]
-            public static void Postfix(PlayerTeam team, Player lastPlayer, Player goalPlayer, Player assistPlayer, Player secondAssistPlayer, Puck puck) {
+            public static void Postfix(PlayerTeam byTeam,
+                NetworkObjectReference goalPlayerNetworkObjectReference,
+                NetworkObjectReference assistPlayerNetworkObjectReference,
+                NetworkObjectReference secondAssistPlayerNetworkObjectReference,
+                NetworkObjectReference puckNetworkObjectReference) {
                 try {
                     // If this is not the server, do not use the patch.
                     if (!ServerFunc.IsDedicatedServer())
                         return;
 
-                    // Check if this is an own goal (only when no offensive player got credit, as determined in Prefix)
+                    // Resolve players and puck from NetworkObjectReferences
+                    Player goalPlayer = NetworkingUtils.GetPlayerFromNetworkObjectReference(goalPlayerNetworkObjectReference);
+                    Player assistPlayer = NetworkingUtils.GetPlayerFromNetworkObjectReference(assistPlayerNetworkObjectReference);
+                    Player secondAssistPlayer = NetworkingUtils.GetPlayerFromNetworkObjectReference(secondAssistPlayerNetworkObjectReference);
+                    Puck puck = NetworkingUtils.GetPuckFromNetworkObjectReference(puckNetworkObjectReference);
+
+                    // For own goals, identify the last defender who touched the puck via our internal tracking
+                    Player lastPlayer = null;
                     bool isOwnGoal = _isCurrentGoalOwnGoal;
+                    if (isOwnGoal) {
+                        PlayerTeam defendingTeam = TeamFunc.GetOtherTeam(byTeam);
+                        lastPlayer = PlayerManager.Instance.GetPlayerBySteamId(_lastPlayerOnPuckTipIncludedSteamId[defendingTeam].SteamId);
+                    }
 
                     // Record play-by-play event first to get precise timestamp
                     PlayByPlayEvent goalEvent = null;
@@ -602,12 +793,24 @@ namespace oomtm450PuckMod_Stats {
                         if (isOwnGoal) {
                             // For own goals, use lastPlayer (last touch) for player info, but set goalscorer (PlayerSteamId) to empty
                             if (lastPlayer != null && lastPlayer) {
-                                RecordPlayByPlayEventInternal(PlayByPlayEventType.OwnGoal, lastPlayer, goalPos, Vector3.zero, "successful");
-                                // Set goalscorer to empty for own goals (playerReferenceSteamID should be null)
-                                if (_playByPlayEvents.Count > 0) {
-                                    var lastEvent = _playByPlayEvents[_playByPlayEvents.Count - 1];
-                                    if (lastEvent.EventType == PlayByPlayEventType.OwnGoal) {
-                                        lastEvent.PlayerSteamId = ""; // Goalscorer is null for own goals
+                                float currentGameTime = GetCurrentGameTime();
+                                int currentPeriod = GetCurrentPeriod();
+                                string ownGoalKey = lastPlayer.SteamId.Value.Value;
+                                bool isDuplicateOwnGoal = ownGoalKey == _lastGoalDedupeSteamId
+                                    && currentPeriod == _lastGoalDedupePeriod
+                                    && Math.Abs(currentGameTime - _lastGoalDedupeTime) < 1.0f;
+
+                                if (!isDuplicateOwnGoal) {
+                                    RecordPlayByPlayEventInternal(PlayByPlayEventType.OwnGoal, lastPlayer, goalPos, Vector3.zero, "successful");
+                                    _lastGoalDedupeSteamId = ownGoalKey;
+                                    _lastGoalDedupePeriod = currentPeriod;
+                                    _lastGoalDedupeTime = currentGameTime;
+                                    // Set goalscorer to empty for own goals (playerReferenceSteamID should be null)
+                                    if (_playByPlayEvents.Count > 0) {
+                                        var lastEvent = _playByPlayEvents[_playByPlayEvents.Count - 1];
+                                        if (lastEvent.EventType == PlayByPlayEventType.OwnGoal) {
+                                            lastEvent.PlayerSteamId = ""; // Goalscorer is null for own goals
+                                        }
                                     }
                                 }
                             }
@@ -615,15 +818,24 @@ namespace oomtm450PuckMod_Stats {
                         else {
                             // Normal goal - use goalPlayer
                             if (goalPlayer != null && goalPlayer) {
-                                RecordPlayByPlayEventInternal(PlayByPlayEventType.Goal, goalPlayer, goalPos, Vector3.zero, "successful");
+                                // Only record the PBP Goal event once ? same dedup check used for _goals below.
+                                float currentGameTime = GetCurrentGameTime();
+                                int currentPeriod = GetCurrentPeriod();
+                                string scorerId = goalPlayer.SteamId.Value.Value;
+                                bool alreadyRecordedInPBP = scorerId == _lastGoalDedupeSteamId
+                                    && currentPeriod == _lastGoalDedupePeriod
+                                    && Math.Abs(currentGameTime - _lastGoalDedupeTime) < 1.0f;
+
+                                if (!alreadyRecordedInPBP) {
+                                    RecordPlayByPlayEventInternal(PlayByPlayEventType.Goal, goalPlayer, goalPos, Vector3.zero, "successful");
+                                }
                                 // Get the just-recorded goal event to use its precise timestamp
                                 if (_playByPlayEvents.Count > 0) {
                                     goalEvent = _playByPlayEvents[_playByPlayEvents.Count - 1];
                                     if (goalEvent.EventType != PlayByPlayEventType.Goal) {
-                                        // Event might have been inserted, find it by matching scorer and recent timestamp
                                         goalEvent = _playByPlayEvents
-                                            .Where(e => e.EventType == PlayByPlayEventType.Goal && 
-                                                       e.PlayerSteamId == goalPlayer.SteamId.Value.ToString() &&
+                                            .Where(e => e.EventType == PlayByPlayEventType.Goal &&
+                                                       e.PlayerSteamId == goalPlayer.SteamId.Value.Value &&
                                                        e.GameTime > 0f)
                                             .OrderByDescending(e => e.GameTime)
                                             .FirstOrDefault();
@@ -638,19 +850,47 @@ namespace oomtm450PuckMod_Stats {
                         // Use precise gameTime and period from play-by-play event if available, otherwise fall back to GetCurrentGameTime
                         float gameTime = goalEvent != null ? goalEvent.GameTime : GetCurrentGameTime();
                         int period = goalEvent != null ? goalEvent.Period : GetCurrentPeriod();
-                        
-                        // Create goal info object
-                        GoalInfo goalInfo = new GoalInfo {
-                            GameTime = gameTime,
-                            Period = period,
-                            Team = team == PlayerTeam.Blue ? "Blue" : "Red",
-                            Scorer = goalPlayer.SteamId.Value.ToString(),
-                            PrimaryAssist = assistPlayer != null ? assistPlayer.SteamId.Value.ToString() : null,
-                            SecondaryAssist = secondAssistPlayer != null ? secondAssistPlayer.SteamId.Value.ToString() : null,
-                            GWG = false // Will be calculated later during export
-                        };
-                        
-                        _goals.Add(goalInfo);
+                        string scorerSteamId = goalPlayer.SteamId.Value.Value;
+
+                        // Dedup guard: Server_NotifyGoalScoredRpc fires once per connected client.
+                        // Only record the goal the first time we see it (same scorer, period, and game time).
+                        bool isDuplicateGoal = scorerSteamId == _lastGoalDedupeSteamId
+                                              && period == _lastGoalDedupePeriod
+                                              && Math.Abs(gameTime - _lastGoalDedupeTime) < 1.0f;
+
+                        if (!isDuplicateGoal) {
+                            _lastGoalDedupeSteamId = scorerSteamId;
+                            _lastGoalDedupePeriod = period;
+                            _lastGoalDedupeTime = gameTime;
+
+                            // Create goal info object
+                            var (defendingGoalieSteamId, isEmptyNet) = ResolveDefendingGoalieForGoal(goalEvent, byTeam);
+                            GoalInfo goalInfo = new GoalInfo {
+                                GameTime = gameTime,
+                                Period = period,
+                                Team = byTeam == PlayerTeam.Blue ? "Blue" : "Red",
+                                Scorer = scorerSteamId,
+                                PrimaryAssist = assistPlayer != null ? assistPlayer.SteamId.Value.Value : null,
+                                SecondaryAssist = secondAssistPlayer != null ? secondAssistPlayer.SteamId.Value.Value : null,
+                                GWG = false, // Will be calculated later during export
+                                DefendingGoalieSteamId = defendingGoalieSteamId,
+                                IsEmptyNet = isEmptyNet
+                            };
+
+                            _goals.Add(goalInfo);
+
+                            if (!isEmptyNet && !string.IsNullOrEmpty(defendingGoalieSteamId))
+                                ReconcileGoalieShotsFaced(defendingGoalieSteamId);
+#if DEBUG_MODE
+                            DebugTrace.Write("PBP", $"GOAL recorded. scorer={goalInfo.Scorer} team={goalInfo.Team} assist1={goalInfo.PrimaryAssist} assist2={goalInfo.SecondaryAssist} totalGoals={_goals.Count}");
+                            DebugTrace.Flush();
+#endif
+                        }
+#if DEBUG_MODE
+                        else {
+                            DebugTrace.Write("PBP", $"GOAL deduped (RPC fired again). scorer={scorerSteamId} period={period} gameTime={gameTime:F2} ? skipped.");
+                        }
+#endif
                     }
 
                     // Reset possession/event logic on goals
@@ -659,7 +899,7 @@ namespace oomtm450PuckMod_Stats {
                     _lastEvent = null;
                 }
                 catch (Exception ex) {
-                    Logging.LogError($"Error in GameManager_Server_GoalScored_Patch Postfix().\n{ex}", ServerConfig);
+                    Logging.LogError($"Error in GameManager_Server_GoalScored_Patch Postfix().\n{ex}", ModServerConfig);
                 }
             }
         }
@@ -676,8 +916,10 @@ namespace oomtm450PuckMod_Stats {
                     if (ServerFunc.IsDedicatedServer())
                         return;
 
-                    _sogLabels.Remove(player.SteamId.Value.ToString());
-                    string steamId = player.SteamId.Value.ToString();
+                    string steamId = player.SteamId.Value.Value;
+                    _sogLabels.Remove(steamId);
+                    UnregisterPlayerTooltipPointerHandlers(steamId);
+                    _sogHoverCallbacksRegistered.Remove(steamId);
                     if (_playerTooltips.TryGetValue(steamId, out VisualElement tooltip)) {
                         tooltip.parent?.Remove(tooltip);
                         _playerTooltips.Remove(steamId);
@@ -685,7 +927,7 @@ namespace oomtm450PuckMod_Stats {
                     _playerTooltipNameLabels.Remove(steamId);
                     _playerTooltipContainers.Remove(steamId);
                     _playerTooltipIsGoalie.Remove(steamId);
-                    _hasUpdatedUIScoreboard.Remove(player.SteamId.Value.ToString());
+                    _hasUpdatedUIScoreboard.Remove(steamId);
                 }
                 catch (Exception ex) {
                     Logging.LogError($"Error in UIScoreboard_RemovePlayer_Patch Postfix().\n{ex}", _clientConfig);
@@ -694,235 +936,212 @@ namespace oomtm450PuckMod_Stats {
         }
 
         /// <summary>
-        /// Class that patches the Server_ResetGameState event from GameManager.
+        /// Exports play-by-play when an in-progress game is aborted (e.g. vote reset). Returns true if exported.
         /// </summary>
-        [HarmonyPatch(typeof(GameManager), nameof(GameManager.Server_ResetGameState))]
-        public class GameManager_Server_ResetGameState_Patch {
-            [HarmonyPostfix]
-            public static void Postfix(bool resetPhase) {
-                try {
-                    // If this is not the server, do not use the patch.
-                    if (!ServerFunc.IsDedicatedServer())
-                        return;
+        private static bool TryExportAbortedGameStats(string endedMessage) {
+            if (_exportedAtResetGameState || _playByPlayEvents.Count == 0)
+                return false;
 
-                    // Reset s%.
-                    List<Player> players = PlayerManager.Instance.GetPlayers();
-                    foreach (string key in new List<string>(_savePerc.Keys)) {
-                        if (players.FirstOrDefault(x => x.SteamId.Value.ToString() == key) != null)
-                            _savePerc[key] = (0, 0);
-                        else
-                            _savePerc.Remove(key);
-                    }
-
-                    // SOG reset is now handled like passes - reset here for server-side, and via RESET_ALL for client-side
-
-                    // Reset stick saves.
-                    foreach (string key in new List<string>(_stickSaves.Keys)) {
-                        if (players.FirstOrDefault(x => x.SteamId.Value.ToString() == key) != null)
-                            _stickSaves[key] = 0;
-                        else
-                            _stickSaves.Remove(key);
-                    }
-
-                    // Reset body saves.
-                    foreach (string key in new List<string>(_bodySaves.Keys)) {
-                        if (players.FirstOrDefault(x => x.SteamId.Value.ToString() == key) != null)
-                            _bodySaves[key] = 0;
-                        else
-                            _bodySaves.Remove(key);
-                    }
-
-                    // Reset blocked shots.
-                    foreach (string key in new List<string>(_blocks.Keys)) {
-                        if (players.FirstOrDefault(x => x.SteamId.Value.ToString() == key) != null)
-                            _blocks[key] = 0;
-                        else
-                            _blocks.Remove(key);
-                    }
-
-                    // Reset hits.
-                    foreach (string key in new List<string>(_hits.Keys)) {
-                        if (players.FirstOrDefault(x => x.SteamId.Value.ToString() == key) != null)
-                            _hits[key] = 0;
-                        else
-                            _hits.Remove(key);
-                    }
-
-                    // Reset takeaways.
-                    foreach (string key in new List<string>(_takeaways.Keys)) {
-                        if (players.FirstOrDefault(x => x.SteamId.Value.ToString() == key) != null)
-                            _takeaways[key] = 0;
-                        else
-                            _takeaways.Remove(key);
-                    }
-
-                    // Reset turnovers.
-                    foreach (string key in new List<string>(_turnovers.Keys)) {
-                        if (players.FirstOrDefault(x => x.SteamId.Value.ToString() == key) != null)
-                            _turnovers[key] = 0;
-                        else
-                            _turnovers.Remove(key);
-                    }
-
-                    // Reset puck touches.
-                    foreach (string key in new List<string>(_puckTouches.Keys)) {
-                        if (players.FirstOrDefault(x => x.SteamId.Value.ToString() == key) != null)
-                            _puckTouches[key] = 0;
-                        else
-                            _puckTouches.Remove(key);
-                    }
-
-                    // Reset shot attempts and home plate shots.
-                    foreach (string key in new List<string>(_shotAttempts.Keys)) {
-                        if (players.FirstOrDefault(x => x.SteamId.Value.ToString() == key) != null)
-                            _shotAttempts[key] = 0;
-                        else
-                            _shotAttempts.Remove(key);
-                    }
-
-                    // Reset exits and entries.
-                    foreach (string key in new List<string>(_exits.Keys)) {
-                        if (players.FirstOrDefault(x => x.SteamId.Value.ToString() == key) != null)
-                            _exits[key] = 0;
-                        else
-                            _exits.Remove(key);
-                    }
-                    foreach (string key in new List<string>(_entries.Keys)) {
-                        if (players.FirstOrDefault(x => x.SteamId.Value.ToString() == key) != null)
-                            _entries[key] = 0;
-                        else
-                            _entries.Remove(key);
-                    }
-
-                    // Reset passes.
-                    foreach (string key in new List<string>(_passes.Keys)) {
-                        if (players.FirstOrDefault(x => x.SteamId.Value.ToString() == key) != null)
-                            _passes[key] = 0;
-                        else
-                            _passes.Remove(key);
-                    }
-
-                    // Reset SOG.
-                    foreach (string key in new List<string>(_sog.Keys)) {
-                        if (players.FirstOrDefault(x => x.SteamId.Value.ToString() == key) != null)
-                            _sog[key] = 0;
-                        else
-                            _sog.Remove(key);
-                    }
-
-                    // Reset possession time.
-                    foreach (string key in new List<string>(_possessionTimeSeconds.Keys)) {
-                        if (players.FirstOrDefault(x => x.SteamId.Value.ToString() == key) != null)
-                            _possessionTimeSeconds[key] = 0.0;
-                        else
-                            _possessionTimeSeconds.Remove(key);
-                    }
-                    _lastPossessionTouchTime.Clear();
-                    _lastPossessionUpdateTime.Clear();
-                    _lastPuckTouchTime.Clear();
-                    _lastPlayerZone.Clear();
-                    
-                    // Reset team stats
-                    _teamShots.Clear();
-                    _teamShotAttempts.Clear();
-                    _teamHomePlateSogs.Clear();
-                    _teamPasses.Clear();
-                    _teamPossessionTime.Clear();
-                    _teamPuckBattleWins.Clear();
-                    _teamPuckBattleLosses.Clear();
-                    _teamFaceoffWins.Clear();
-                    _teamFaceoffTotal.Clear();
-                    _teamTakeaways.Clear();
-                    _teamTurnovers.Clear();
-                    _teamExits.Clear();
-                    _teamEntries.Clear();
-                    
-                    // Clear recent turnovers tracking
-                    _recentTurnovers.Clear();
-                    
-                    // Clear time on ice tracking
-                    _timeOnIceSeconds.Clear();
-                    
-                    // Clear plus/minus tracking
-                    _plusMinus.Clear();
-                    
-                    // Reset continuous team possession tracking
-                    _currentTeamPossession = PlayerTeam.None;
-                    _teamPossessionStartTime = DateTime.UtcNow;
-                    _teamLastEventTime.Clear();
-
-                    // Reset goal and assists trackers.
-                    _goals.Clear();
-
-                    // Reset last possession.
-                    _lastPossession = new Possession();
-                    _wasTippedLastFrame = false;
-
-                    // Reset play-by-play events and tracking
-                    _playByPlayEvents.Clear();
-                    _nextPlayByPlayEventId = 0;
-                    _lastProcessedZoneFlagEventId = -1; // Reset zone flag scanner
-                    _currentGameReferenceId = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
-                    _currentTeamInPossession = PlayerTeam.None;
-                    _currentPlayInPossession = 0;
-                    _gameStartTime = 0f; // Reset so it initializes on next game start
-                    _currentPeriod = 1;
-                    _lastTrackedPeriod = 0; // Reset period tracking
-                    _faceoffRecordedForCurrentPeriod = false;
-                    _lastEvent = null;
-                    
-                    // Reset game time tracking for fractional precision
-                    _lastWholeSecondGameTime = 0f;
-                    _lastUnityTimeForGameTime = 0f;
-                    _lastCountdownValue = -1;
-                    
-                    // Clear pending shot releases
-                    foreach (PlayerTeam team in new List<PlayerTeam>(_pendingShotReleases.Keys)) {
-                        _pendingShotReleases[team] = ("", Vector3.zero, Vector3.zero, Vector3.zero, DateTime.MinValue);
-                    }
-                    
-                    // Reset raycast state tracking
-                    foreach (PlayerTeam team in new List<PlayerTeam>(_previousRaycastState.Keys)) {
-                        _previousRaycastState[team] = false;
-                    }
-                    
-                    // Reset raycast frame counters
-                    foreach (PlayerTeam team in new List<PlayerTeam>(_raycastTrueFrames.Keys)) {
-                        _raycastTrueFrames[team] = 0;
-                    }
-                    
-                    // Reset shot recorded flags
-                    foreach (PlayerTeam team in new List<PlayerTeam>(_shotRecordedForRaycast.Keys)) {
-                        _shotRecordedForRaycast[team] = false;
-                    }
-                    
-                    // Reset shot attempt cooldown
-                    _lastShotAttemptGameTime.Clear();
-                    
-                    // Reset zone exit/entry flags
-                    foreach (PlayerTeam team in new List<PlayerTeam>(_teamHasExitedDZ.Keys)) {
-                        _teamHasExitedDZ[team] = false;
-                    }
-                    foreach (PlayerTeam team in new List<PlayerTeam>(_teamHasEnteredOZ.Keys)) {
-                        _teamHasEnteredOZ[team] = false;
-                    }
-
-                    // Clear pending stat updates (but don't reset tooltips here - they reset when new game begins)
-                    _pendingStatUpdates.Clear();
-
-                    _sentOutOfDateMessage.Clear();
-                }
-                catch (Exception ex) {
-                    Logging.LogError($"Error in GameManager_Server_ResetGameState_Patch Postfix().\n{ex}", ServerConfig);
-                }
+            int uniquePlayerCount = 0;
+            int eventCount = _playByPlayEvents.Count;
+            try {
+                uniquePlayerCount = _playByPlayEvents.Where(e => !string.IsNullOrEmpty(e.PlayerSteamId)).Select(e => e.PlayerSteamId).Distinct().Count();
             }
+            catch { }
+
+            bool meetsCriteria = !ModServerConfig.EnableExportLimit || (uniquePlayerCount >= 8 && eventCount >= 300);
+            if (!meetsCriteria) {
+                if (ModServerConfig.EnableExportLimit) {
+                    Logging.Log($"Aborted game export skipped — {uniquePlayerCount} unique players (need 8+), {eventCount} events (need 300+)", ModServerConfig);
+                }
+                return false;
+            }
+
+            Logging.Log($"Aborted game export ({endedMessage}) — exporting before reset", ModServerConfig);
+            bool hasGameEndEvent = _playByPlayEvents.Any(e => e.EventType == PlayByPlayEventType.GameEnd);
+            if (!hasGameEndEvent) {
+                int finalPeriod = GetCurrentPeriod();
+                float maxGameTime = _playByPlayEvents.Count > 0 ? _playByPlayEvents.Max(e => e.GameTime) : 0f;
+                float gameEndGameTime = maxGameTime > 0f ? maxGameTime : GetCurrentGameTime();
+                var gameEndEvent = new PlayByPlayEvent { EventId = _nextPlayByPlayEventId++, EventType = PlayByPlayEventType.GameEnd, GameTime = gameEndGameTime, Period = finalPeriod, PlayerSteamId = "", PlayerName = "", PlayerTeam = 0, PlayerPosition = "", PlayerJersey = 0, PlayerSpeed = 0f, Zone = EventZone.Neutral, Position = Vector3.zero, Velocity = Vector3.zero, ForceMagnitude = 0f, Outcome = "end", Flags = "", Team = "", TeamInPossession = _currentTeamInPossession != PlayerTeam.None ? (_currentTeamInPossession == PlayerTeam.Blue ? "Blue" : "Red") : "", CurrentPlayInPossession = _currentPlayInPossession.ToString(), ScoreState = GetScoreState(PlayerTeam.None), Timestamp = DateTime.UtcNow };
+                CaptureTeamRosterData(gameEndEvent);
+                int insertIndex = _playByPlayEvents.Count;
+                for (int i = 0; i < _playByPlayEvents.Count; i++) {
+                    if (_playByPlayEvents[i].GameTime >= gameEndGameTime) {
+                        insertIndex = i;
+                        break;
+                    }
+                }
+                _playByPlayEvents.Insert(insertIndex, gameEndEvent);
+            }
+
+            ExportGameStats(forceExport: false);
+            _exportedAtResetGameState = true;
+            string gameReferenceId = !string.IsNullOrEmpty(_currentGameReferenceId) ? _currentGameReferenceId : DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+            string sanitizedFileHeader = StripHtmlTags(ModServerConfig.FileHeaderName);
+            string fullFileName = $"{sanitizedFileHeader}_{gameReferenceId}_stats";
+            NetworkBehaviourSingleton<ChatManager>.Instance.Server_BroadcastChatMessage($"{endedMessage} Stats exported - {fullFileName}");
+            return true;
         }
+
+        /// <summary>
+        /// Performs full server-side stats and play-by-play reset. Called on PreGame entry (new game) or Warmup -> FaceOff fallback.
+        /// </summary>
+        private static void ResetAllServerStatsAndPlayByPlay() {
+            List<Player> players = PlayerManager.Instance != null ? PlayerManager.Instance.GetPlayers() : new List<Player>();
+            foreach (string key in new List<string>(_savePerc.Keys)) {
+                if (players.Count > 0 && players.FirstOrDefault(x => x.SteamId.Value.Value == key) != null)
+                    _savePerc[key] = (0, 0);
+                else
+                    _savePerc.Remove(key);
+            }
+            foreach (string key in new List<string>(_stickSaves.Keys)) {
+                if (players.Count > 0 && players.FirstOrDefault(x => x.SteamId.Value.Value == key) != null)
+                    _stickSaves[key] = 0;
+                else
+                    _stickSaves.Remove(key);
+            }
+            foreach (string key in new List<string>(_bodySaves.Keys)) {
+                if (players.Count > 0 && players.FirstOrDefault(x => x.SteamId.Value.Value == key) != null)
+                    _bodySaves[key] = 0;
+                else
+                    _bodySaves.Remove(key);
+            }
+            foreach (string key in new List<string>(_blocks.Keys)) {
+                if (players.Count > 0 && players.FirstOrDefault(x => x.SteamId.Value.Value == key) != null)
+                    _blocks[key] = 0;
+                else
+                    _blocks.Remove(key);
+            }
+            foreach (string key in new List<string>(_hits.Keys)) {
+                if (players.Count > 0 && players.FirstOrDefault(x => x.SteamId.Value.Value == key) != null)
+                    _hits[key] = 0;
+                else
+                    _hits.Remove(key);
+            }
+            foreach (string key in new List<string>(_takeaways.Keys)) {
+                if (players.Count > 0 && players.FirstOrDefault(x => x.SteamId.Value.Value == key) != null)
+                    _takeaways[key] = 0;
+                else
+                    _takeaways.Remove(key);
+            }
+            foreach (string key in new List<string>(_turnovers.Keys)) {
+                if (players.Count > 0 && players.FirstOrDefault(x => x.SteamId.Value.Value == key) != null)
+                    _turnovers[key] = 0;
+                else
+                    _turnovers.Remove(key);
+            }
+            foreach (string key in new List<string>(_puckTouches.Keys)) {
+                if (players.Count > 0 && players.FirstOrDefault(x => x.SteamId.Value.Value == key) != null)
+                    _puckTouches[key] = 0;
+                else
+                    _puckTouches.Remove(key);
+            }
+            foreach (string key in new List<string>(_shotAttempts.Keys)) {
+                if (players.Count > 0 && players.FirstOrDefault(x => x.SteamId.Value.Value == key) != null)
+                    _shotAttempts[key] = 0;
+                else
+                    _shotAttempts.Remove(key);
+            }
+            foreach (string key in new List<string>(_exits.Keys)) {
+                if (players.Count > 0 && players.FirstOrDefault(x => x.SteamId.Value.Value == key) != null)
+                    _exits[key] = 0;
+                else
+                    _exits.Remove(key);
+            }
+            foreach (string key in new List<string>(_entries.Keys)) {
+                if (players.Count > 0 && players.FirstOrDefault(x => x.SteamId.Value.Value == key) != null)
+                    _entries[key] = 0;
+                else
+                    _entries.Remove(key);
+            }
+            foreach (string key in new List<string>(_passes.Keys)) {
+                if (players.Count > 0 && players.FirstOrDefault(x => x.SteamId.Value.Value == key) != null)
+                    _passes[key] = 0;
+                else
+                    _passes.Remove(key);
+            }
+            foreach (string key in new List<string>(_sog.Keys)) {
+                if (players.Count > 0 && players.FirstOrDefault(x => x.SteamId.Value.Value == key) != null)
+                    _sog[key] = 0;
+                else
+                    _sog.Remove(key);
+            }
+            foreach (string key in new List<string>(_possessionTimeSeconds.Keys)) {
+                if (players.Count > 0 && players.FirstOrDefault(x => x.SteamId.Value.Value == key) != null)
+                    _possessionTimeSeconds[key] = 0.0;
+                else
+                    _possessionTimeSeconds.Remove(key);
+            }
+            _lastPossessionTouchTime.Clear();
+            _lastPossessionUpdateTime.Clear();
+            _lastPuckTouchTime.Clear();
+            _lastPlayerZone.Clear();
+            _teamShots.Clear();
+            _teamShotAttempts.Clear();
+            _teamHomePlateSogs.Clear();
+            _teamPasses.Clear();
+            _teamPossessionTime.Clear();
+            _teamPuckBattleWins.Clear();
+            _teamPuckBattleLosses.Clear();
+            _teamFaceoffWins.Clear();
+            _teamFaceoffTotal.Clear();
+            _teamTakeaways.Clear();
+            _teamTurnovers.Clear();
+            _teamExits.Clear();
+            _teamEntries.Clear();
+            _recentTurnovers.Clear();
+            _timeOnIceSeconds.Clear();
+            _plusMinus.Clear();
+            _currentTeamPossession = PlayerTeam.None;
+            _teamPossessionStartTime = DateTime.UtcNow;
+            _teamLastEventTime.Clear();
+            _goals.Clear();
+            _lastGoalDedupeTime = -1f;
+            _lastGoalDedupeSteamId = null;
+            _lastGoalDedupePeriod = -1;
+            _lastPossession = new Possession();
+            _wasTippedLastFrame = false;
+            _playByPlayEvents.Clear();
+            _nextPlayByPlayEventId = 0;
+            _lastProcessedZoneFlagEventId = -1;
+            _currentGameReferenceId = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+            _currentTeamInPossession = PlayerTeam.None;
+            _currentPlayInPossession = 0;
+            _gameStartTime = Time.time;
+            _currentPeriod = 1;
+            _lastTrackedPeriod = 0;
+            _faceoffRecordedForCurrentPeriod = false;
+            _lastEvent = null;
+            _lastWholeSecondGameTime = 0f;
+            _lastUnityTimeForGameTime = 0f;
+            _lastCountdownValue = -1;
+            foreach (PlayerTeam team in new List<PlayerTeam>(_pendingShotReleases.Keys))
+                _pendingShotReleases[team] = ("", Vector3.zero, Vector3.zero, Vector3.zero, DateTime.MinValue);
+            foreach (PlayerTeam team in new List<PlayerTeam>(_previousRaycastState.Keys))
+                _previousRaycastState[team] = false;
+            foreach (PlayerTeam team in new List<PlayerTeam>(_raycastTrueFrames.Keys))
+                _raycastTrueFrames[team] = 0;
+            foreach (PlayerTeam team in new List<PlayerTeam>(_shotRecordedForRaycast.Keys))
+                _shotRecordedForRaycast[team] = false;
+            _lastShotAttemptGameTime.Clear();
+            foreach (PlayerTeam team in new List<PlayerTeam>(_teamHasExitedDZ.Keys))
+                _teamHasExitedDZ[team] = false;
+            foreach (PlayerTeam team in new List<PlayerTeam>(_teamHasEnteredOZ.Keys))
+                _teamHasEnteredOZ[team] = false;
+            _pendingStatUpdates.Clear();
+            _serverPlayLogicTick = 0;
+        }
+
+        // Server_ResetGameState was removed in B310.
+        // Early-export is handled by Event_Everyone_OnGameStateChanged.
+        // Per-game stat reset is handled by ResetAllServerStatsAndPlayByPlay().
 
         /// <summary>
         /// Class that patches the Update event from ServerManager.
         /// </summary>
-        [HarmonyPatch(typeof(ServerManager), "Update")]
-        public class ServerManager_Update_Patch {
+        [HarmonyPatch(typeof(GameManager), "Server_Tick")]
+        public class GameManager_Server_Tick_Patch {
             [HarmonyPostfix]
             public static void Postfix() {
                 try {
@@ -940,7 +1159,7 @@ namespace oomtm450PuckMod_Stats {
                         catch (Exception ex) {
                             // Extra safety net - should never reach here due to internal try-catch
                             // but this ensures the server never crashes from batching
-                            Logging.LogError($"Unexpected error calling SendBatchedStatUpdates (this should not happen): {ex}", ServerConfig);
+                            Logging.LogError($"Unexpected error calling SendBatchedStatUpdates (this should not happen): {ex}", ModServerConfig);
                         }
                     }
                     
@@ -950,15 +1169,16 @@ namespace oomtm450PuckMod_Stats {
                         _lastZoneFlagScanTime = now;
                     }
 
-                    bool sendSavePercDuringGoalNextFrame = _sendSavePercDuringGoalNextFrame;
-                    if (sendSavePercDuringGoalNextFrame) {
-                        _sendSavePercDuringGoalNextFrame = false;
-                        SendSavePercDuringGoal(_sendSavePercDuringGoalNextFrame_Player.Team.Value, SendSOGDuringGoal(_sendSavePercDuringGoalNextFrame_Player));
-                    }
+                    // Legacy SOG stat-trigger path removed: it called SendSavePercDuringGoal on non-goal
+                    // SOG updates and could decrement saves or add phantom shots faced. Goals are
+                    // handled exclusively by GameManager_Server_GoalScored_Patch (Harmony Prefix).
 
                     // If game is not started, do not use the rest of the patch.
-                    if (PlayerManager.Instance == null || PuckManager.Instance == null || GameManager.Instance.Phase != GamePhase.Playing || _paused)
+                    if (PlayerManager.Instance == null || PuckManager.Instance == null || GameManager.Instance.Phase != GamePhase.Play || _paused)
                         return;
+
+                    _serverPlayLogicTick++;
+                    bool runPlayByPlayScan = (_serverPlayLogicTick % SERVER_PLAY_LOGIC_EVERY_N_TICKS == 0);
 
                     // Check for raycast state changes and record shots when raycast confirms
                     foreach (PlayerTeam defendingTeam in new List<PlayerTeam> { PlayerTeam.Blue, PlayerTeam.Red }) {
@@ -991,35 +1211,38 @@ namespace oomtm450PuckMod_Stats {
                             // Don't clear pending release here - it will be cleared when save/goal is recorded
                         }
                         
-                        // Check for missed shots (unconfirmed attempts that never got raycast confirmation)
-                        // Mark as "missed" based on zone-based timeout: OZ=2s, NZ=4s, DZ=6s
-                        PlayerTeam attackingTeamForMissed = TeamFunc.GetOtherTeam(defendingTeam);
-                        
-                        // Check ALL "attempt" shots for this team and mark as "missed" if old enough
-                        var unconfirmedAttemptShots = _playByPlayEvents
-                            .Where(e => e.EventType == PlayByPlayEventType.Shot &&
-                                       e.PlayerTeam == (int)attackingTeamForMissed &&
-                                       e.Outcome == "attempt")
-                            .ToList();
-                        
-                        foreach (var shotEvent in unconfirmedAttemptShots) {
-                            // Get zone-based timeout: OZ=2s, NZ=4s, DZ=6s
-                            float timeoutSeconds = GetShotTimeoutByZone(shotEvent.Zone);
-                            float ageInSeconds = currentGameTime - shotEvent.GameTime;
+                        // Expensive play-by-play scans — throttled to every N ticks (PuckRaycast updates every 6 frames).
+                        if (runPlayByPlayScan) {
+                            // Check for missed shots (unconfirmed attempts that never got raycast confirmation)
+                            // Mark as "missed" based on zone-based timeout: OZ=2s, NZ=4s, DZ=6s
+                            PlayerTeam attackingTeamForMissed = TeamFunc.GetOtherTeam(defendingTeam);
                             
-                            // Only check if shot is old enough based on its zone
-                            if (ageInSeconds > timeoutSeconds) {
-                                // Only mark as missed if no save/goal/block occurred for this shot
-                                // Use longer timeout (3 seconds) to account for delayed saves
-                                bool saveGoalOrBlockRecorded = _playByPlayEvents.Any(e =>
-                                    (e.EventType == PlayByPlayEventType.Save ||
-                                     e.EventType == PlayByPlayEventType.Goal ||
-                                     e.EventType == PlayByPlayEventType.Block) &&
-                                    e.GameTime >= shotEvent.GameTime &&
-                                    e.GameTime <= shotEvent.GameTime + 3f);
+                            // Check ALL "attempt" shots for this team and mark as "missed" if old enough
+                            var unconfirmedAttemptShots = _playByPlayEvents
+                                .Where(e => e.EventType == PlayByPlayEventType.Shot &&
+                                           e.PlayerTeam == (int)attackingTeamForMissed &&
+                                           e.Outcome == "attempt")
+                                .ToList();
+                            
+                            foreach (var shotEvent in unconfirmedAttemptShots) {
+                                // Get zone-based timeout: OZ=2s, NZ=4s, DZ=6s
+                                float timeoutSeconds = GetShotTimeoutByZone(shotEvent.Zone);
+                                float ageInSeconds = currentGameTime - shotEvent.GameTime;
                                 
-                                if (!saveGoalOrBlockRecorded) {
-                                    shotEvent.Outcome = "missed";
+                                // Only check if shot is old enough based on its zone
+                                if (ageInSeconds > timeoutSeconds) {
+                                    // Only mark as missed if no save/goal/block occurred for this shot
+                                    // Use longer timeout (3 seconds) to account for delayed saves
+                                    bool saveGoalOrBlockRecorded = _playByPlayEvents.Any(e =>
+                                        (e.EventType == PlayByPlayEventType.Save ||
+                                         e.EventType == PlayByPlayEventType.Goal ||
+                                         e.EventType == PlayByPlayEventType.Block) &&
+                                        e.GameTime >= shotEvent.GameTime &&
+                                        e.GameTime <= shotEvent.GameTime + 3f);
+                                    
+                                    if (!saveGoalOrBlockRecorded) {
+                                        shotEvent.Outcome = "missed";
+                                    }
                                 }
                             }
                         }
@@ -1027,35 +1250,37 @@ namespace oomtm450PuckMod_Stats {
                         // Reset shot recorded flag when raycast goes back to false (new shot cycle)
                         // If shot was marked "on net" but no save/goal was recorded, mark it as "missed"
                         if (!currentRaycastState && previousRaycastState) {
-                            PlayerTeam attackingTeamForReset = TeamFunc.GetOtherTeam(defendingTeam);
-                            
-                            // Find recent "on net" shots for this team (within last 2 seconds) that might need correction
-                            float resetGameTime = GetCurrentGameTime();
-                            var recentOnNetShots = _playByPlayEvents
-                                .Where(e => e.EventType == PlayByPlayEventType.Shot && 
-                                           e.PlayerTeam == (int)attackingTeamForReset &&
-                                           e.Outcome == "on net" &&
-                                           e.GameTime >= resetGameTime - 2f)
-                                .ToList();
-                            
-                            foreach (var shotEvent in recentOnNetShots) {
-                                // Check if save, goal, or block was recorded for this shot (within 4 seconds after shot)
-                                bool saveGoalOrBlockRecorded = _playByPlayEvents.Any(e => 
-                                    (e.EventType == PlayByPlayEventType.Save || 
-                                     e.EventType == PlayByPlayEventType.Goal ||
-                                     e.EventType == PlayByPlayEventType.Block) &&
-                                    e.GameTime >= shotEvent.GameTime &&
-                                    e.GameTime <= shotEvent.GameTime + 4f);
+                            if (runPlayByPlayScan) {
+                                PlayerTeam attackingTeamForReset = TeamFunc.GetOtherTeam(defendingTeam);
                                 
-                                // Only mark as "missed" if it wasn't already marked as "blocked" and no save/goal/block occurred
-                                if (!saveGoalOrBlockRecorded && shotEvent.Outcome != "blocked") {
-                                    // Shot was marked "on net" but didn't result in save/goal/block - mark as "missed"
-                                    shotEvent.Outcome = "missed";
+                                // Find recent "on net" shots for this team (within last 2 seconds) that might need correction
+                                float resetGameTime = GetCurrentGameTime();
+                                var recentOnNetShots = _playByPlayEvents
+                                    .Where(e => e.EventType == PlayByPlayEventType.Shot && 
+                                               e.PlayerTeam == (int)attackingTeamForReset &&
+                                               e.Outcome == "on net" &&
+                                               e.GameTime >= resetGameTime - 2f)
+                                    .ToList();
+                                
+                                foreach (var shotEvent in recentOnNetShots) {
+                                    // Check if save, goal, or block was recorded for this shot (within 4 seconds after shot)
+                                    bool saveGoalOrBlockRecorded = _playByPlayEvents.Any(e => 
+                                        (e.EventType == PlayByPlayEventType.Save || 
+                                         e.EventType == PlayByPlayEventType.Goal ||
+                                         e.EventType == PlayByPlayEventType.Block) &&
+                                        e.GameTime >= shotEvent.GameTime &&
+                                        e.GameTime <= shotEvent.GameTime + 4f);
                                     
-                                    // Clear home plate flag for missed shots - they shouldn't count as home plate SOGs
-                                    // (Home plate SOGs should only be tracked when save/goal occurs)
-                                    if (shotEvent.Flags == "HomePlate") {
-                                        shotEvent.Flags = ""; // Clear flag for missed shots
+                                    // Only mark as "missed" if it wasn't already marked as "blocked" and no save/goal/block occurred
+                                    if (!saveGoalOrBlockRecorded && shotEvent.Outcome != "blocked") {
+                                        // Shot was marked "on net" but didn't result in save/goal/block - mark as "missed"
+                                        shotEvent.Outcome = "missed";
+                                        
+                                        // Clear home plate flag for missed shots - they shouldn't count as home plate SOGs
+                                        // (Home plate SOGs should only be tracked when save/goal occurs)
+                                        if (shotEvent.Flags == "HomePlate") {
+                                            shotEvent.Flags = ""; // Clear flag for missed shots
+                                        }
                                     }
                                 }
                             }
@@ -1069,15 +1294,14 @@ namespace oomtm450PuckMod_Stats {
                     }
 
                     // Save logic.
-                    if (!sendSavePercDuringGoalNextFrame) {
-                        foreach (PlayerTeam key in new List<PlayerTeam>(_checkIfPuckWasSaved.Keys)) {
+                    foreach (PlayerTeam key in new List<PlayerTeam>(_checkIfPuckWasSaved.Keys)) {
                             SaveCheck saveCheck = _checkIfPuckWasSaved[key];
                             if (!saveCheck.HasToCheck) {
                                 _checkIfPuckWasSaved[key] = new SaveCheck();
                                 continue;
                             }
 
-                            //Logging.Log($"kvp.Check {saveCheck.FramesChecked} for team net {key} by {saveCheck.ShooterSteamId}.", ServerConfig, true);
+                            //Logging.Log($"kvp.Check {saveCheck.FramesChecked} for team net {key} by {saveCheck.ShooterSteamId}.", ModServerConfig, true);
 
                             if (!_puckRaycast.PuckIsGoingToNet[key] && !_lastShotWasCounted[saveCheck.ShooterTeam]) {
                                 // Record SOG first
@@ -1100,16 +1324,16 @@ namespace oomtm450PuckMod_Stats {
                                 // Get other team goalie.
                                 Player goalie = PlayerFunc.GetOtherTeamGoalie(saveCheck.ShooterTeam);
                                 if (goalie != null) {
-                                    string _goaliePlayerSteamId = goalie.SteamId.Value.ToString();
+                                    string _goaliePlayerSteamId = goalie.SteamId.Value.Value;
                                     if (!_savePerc.TryGetValue(_goaliePlayerSteamId, out var savePercValue)) {
                                         _savePerc.Add(_goaliePlayerSteamId, (0, 0));
                                         savePercValue = (0, 0);
                                     }
 
-                                    (int saves, int sog) = _savePerc[_goaliePlayerSteamId] = (++savePercValue.Saves, ++savePercValue.Shots);
-
+                                    _savePerc[_goaliePlayerSteamId] = (++savePercValue.Saves, ++savePercValue.Shots);
+                                    ReconcileGoalieShotsFaced(_goaliePlayerSteamId);
                                     QueueStatUpdate(Codebase.Constants.SAVEPERC + _goaliePlayerSteamId, _savePerc[_goaliePlayerSteamId].ToString());
-                                    LogSavePerc(_goaliePlayerSteamId, saves, sog);
+                                    LogSavePerc(_goaliePlayerSteamId, _savePerc[_goaliePlayerSteamId].Saves, _savePerc[_goaliePlayerSteamId].Shots);
                                     
                                     // Reset shot attempt cooldown for the shooter when a save is recorded
                                     // This allows immediate shot attempts after a save
@@ -1284,7 +1508,7 @@ namespace oomtm450PuckMod_Stats {
                                                     e.GameTime >= currentGameTime - 5f);
                                                 
                                                 if (existingShot == null) {
-                                                    string shotFlag = DetermineShotFlag(releaseInfo.PuckPosition, shooter.Team.Value);
+                                                    string shotFlag = DetermineShotFlag(releaseInfo.PuckPosition, shooter.Team);
                                                     RecordPlayByPlayEventInternal(PlayByPlayEventType.Shot, shooter, releaseInfo.PuckPosition, releaseInfo.PuckVelocity, "on net", shotFlag);
                                                     
                                                     // Track shot attempt stats for retroactive shot (player and team)
@@ -1368,7 +1592,7 @@ namespace oomtm450PuckMod_Stats {
                                             }
                                             
                                             // Determine flag based on position (only if position is valid)
-                                            string shotFlag = (shotPosition != Vector3.zero) ? DetermineShotFlag(shotPosition, shooter.Team.Value) : "";
+                                            string shotFlag = (shotPosition != Vector3.zero) ? DetermineShotFlag(shotPosition, shooter.Team) : "";
                                             
                                             // Record shot with touch event data (GameTime, PlayerSpeed, Velocity, Position)
                                             // ForceMagnitude will be automatically calculated from velocity.magnitude
@@ -1401,7 +1625,7 @@ namespace oomtm450PuckMod_Stats {
                                                 
                                                 // Also track home plate save for goalie (since we're creating retroactive shot from touch)
                                                 if (goalie != null && goalie) {
-                                                    string _goaliePlayerSteamId = goalie.SteamId.Value.ToString();
+                                                    string _goaliePlayerSteamId = goalie.SteamId.Value.Value;
                                                     if (!_homePlateSaves.TryGetValue(_goaliePlayerSteamId, out int hpSaveValue)) {
                                                         _homePlateSaves.Add(_goaliePlayerSteamId, 0);
                                                         hpSaveValue = 0;
@@ -1427,7 +1651,7 @@ namespace oomtm450PuckMod_Stats {
                                 _checkIfPuckWasBlocked[key] = new BlockCheck();
                             }
                             else {
-                                if (++saveCheck.FramesChecked > ServerManager.Instance.ServerConfigurationManager.ServerConfiguration.serverTickRate)
+                                if (++saveCheck.FramesChecked > ServerManager.Instance.Server.Value.TickRate)
                                     _checkIfPuckWasSaved[key] = new SaveCheck();
                             }
                         }
@@ -1442,7 +1666,7 @@ namespace oomtm450PuckMod_Stats {
                                 continue;
                             }
 
-                            //Logging.Log($"kvp.Check {blockCheck.FramesChecked} for team {key} blocked by {blockCheck.BlockerSteamId}.", ServerConfig, true);
+                            //Logging.Log($"kvp.Check {blockCheck.FramesChecked} for team {key} blocked by {blockCheck.BlockerSteamId}.", ModServerConfig, true);
 
                             // Only process block if:
                             // 1. Puck stopped going to net (PuckIsGoingToNet became false)
@@ -1499,20 +1723,19 @@ namespace oomtm450PuckMod_Stats {
                                 _checkIfPuckWasBlocked[key] = new BlockCheck();
                             }
                             else {
-                                if (++blockCheck.FramesChecked > ServerManager.Instance.ServerConfigurationManager.ServerConfiguration.serverTickRate)
+                                if (++blockCheck.FramesChecked > ServerManager.Instance.Server.Value.TickRate)
                                     _checkIfPuckWasBlocked[key] = new BlockCheck();
                             }
                         }
-                    }
 
                     Puck puck = PuckManager.Instance.GetPuck();
                     if (puck) {
-                        _puckZCoordinateDifference = (puck.Rigidbody.transform.position.z - _puckLastCoordinate.z) / 240 * ServerManager.Instance.ServerConfigurationManager.ServerConfiguration.serverTickRate;
+                        _puckZCoordinateDifference = (puck.Rigidbody.transform.position.z - _puckLastCoordinate.z) / 240 * ServerManager.Instance.Server.Value.TickRate;
                         _puckLastCoordinate = new Vector3(puck.Rigidbody.transform.position.x, puck.Rigidbody.transform.position.y, puck.Rigidbody.transform.position.z);
                     }
                 }
                 catch (Exception ex) {
-                    Logging.LogError($"Error in ServerManager_Update_Patch Postfix().\n{ex}", ServerConfig);
+                    Logging.LogError($"Error in ServerManager_Update_Patch Postfix().\n{ex}", ModServerConfig);
                 }
 
                 return;
@@ -1522,8 +1745,9 @@ namespace oomtm450PuckMod_Stats {
         /// <summary>
         /// Class that patches the UpdatePlayer event from UIScoreboard.
         /// </summary>
-        [HarmonyPatch(typeof(UIScoreboard), nameof(UIScoreboard.UpdatePlayer))]
-        public class UIScoreboard_UpdatePlayer_Patch {
+        // UpdatePlayer was renamed in B323; using string literal so compile succeeds ? verify method name at runtime
+        [HarmonyPatch(typeof(UIScoreboard), nameof(UIScoreboard.StylePlayer))]
+        public class UIScoreboard_StylePlayer_Patch {
             [HarmonyPostfix]
             public static void Postfix(UIScoreboard __instance, Player player) {
                 try {
@@ -1531,43 +1755,48 @@ namespace oomtm450PuckMod_Stats {
                     if (ServerFunc.IsDedicatedServer())
                         return;
 
-                    if (!_hasRegisteredWithNamedMessageHandler || !_serverHasResponded) {
+                    #if DEBUG_MODE
+                    DebugTrace.Write("StylePlayer", $"Patch firing. serverHasResponded={_serverHasResponded} registered={_hasRegisteredWithNamedMessageHandler}");
+                    #endif
+
+                    if (!_hasRegisteredWithNamedMessageHandler) {
                         NetworkManager.Singleton.CustomMessagingManager.RegisterNamedMessageHandler(Constants.FROM_SERVER_TO_CLIENT, ReceiveData);
                         _hasRegisteredWithNamedMessageHandler = true;
+                    }
 
+                    if (!_serverHasResponded) {
                         DateTime now = DateTime.UtcNow;
                         if (_lastDateTimeAskStartupData + TimeSpan.FromSeconds(1) < now && _askServerForStartupDataCount++ < 10) {
                             _lastDateTimeAskStartupData = now;
-                            NetworkCommunication.SendData(Constants.ASK_SERVER_FOR_STARTUP_DATA, "1", NetworkManager.ServerClientId, Constants.FROM_CLIENT_TO_SERVER, _clientConfig);
+                            NetworkCommunication.SendData(Constants.ASK_SERVER_FOR_STARTUP_DATA, MOD_VERSION, NetworkManager.ServerClientId, Constants.FROM_CLIENT_TO_SERVER, _clientConfig);
                         }
                     }
-                    else if (_askForKick) {
-                        _askForKick = false;
-                        NetworkCommunication.SendData(Constants.MOD_NAME + "_kick", "1", NetworkManager.ServerClientId, Constants.FROM_CLIENT_TO_SERVER, _clientConfig);
-                    }
-                    else if (_addServerModVersionOutOfDateMessage) {
-                        _addServerModVersionOutOfDateMessage = false;
-                        UIChat.Instance.AddChatMessage($"Server's {Constants.WORKSHOP_MOD_NAME} mod is out of date. Some functionalities might not work properly.");
-                    }
 
-                    ScoreboardModifications(true);
 
-                    string playerSteamId = player.SteamId.Value.ToString();
-                    if (!string.IsNullOrEmpty(playerSteamId) && _stars.Values.Contains(playerSteamId)) {
-                        Dictionary<Player, VisualElement> playerVisualElementMap =
-                            SystemFunc.GetPrivateField<Dictionary<Player, VisualElement>>(typeof(UIScoreboard), __instance, "playerVisualElementMap");
-
-                        if (playerVisualElementMap.ContainsKey(player)) {
-                            VisualElement visualElement = playerVisualElementMap[player];
-                            Label label = visualElement.Query<Label>("UsernameLabel");
-                            // Strip any existing star tags before adding the correct one
-                            string baseText = StripStarTags(label.text);
-                            label.text = GetStarTag(playerSteamId) + baseText;
-                        }
-                    }
+                    OnClientStylePlayer(__instance, player);
                 }
                 catch (Exception ex) {
                     Logging.LogError($"Error in UIScoreboard_UpdateServer_Patch Postfix().\n{ex}", _clientConfig);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Re-applies position sort after the game's SortPlayers so vanilla reordering does not win.
+        /// </summary>
+        [HarmonyPatch(typeof(UIScoreboard), nameof(UIScoreboard.SortPlayers))]
+        public class UIScoreboard_SortPlayers_Patch {
+            [HarmonyPostfix]
+            public static void Postfix(UIScoreboard __instance) {
+                if (ServerFunc.IsDedicatedServer())
+                    return;
+
+                try {
+                    VisualElement scoreboardContainer = SystemFunc.GetPrivateField<VisualElement>(typeof(UIScoreboard), __instance, "scoreboard");
+                    ReorderScoreboardPlayers(scoreboardContainer);
+                }
+                catch (Exception ex) {
+                    Logging.LogError($"Error in UIScoreboard_SortPlayers_Patch Postfix().\n{ex}", _clientConfig);
                 }
             }
         }
@@ -1580,14 +1809,14 @@ namespace oomtm450PuckMod_Stats {
             [HarmonyPostfix]
             public static void Postfix(Puck __instance, Collision collision) {
                 // If this is not the server or game is not started, do not use the patch.
-                if (!ServerFunc.IsDedicatedServer() || _paused || GameManager.Instance.Phase != GamePhase.Playing || !_logic)
+                if (!ServerFunc.IsDedicatedServer() || _paused || GameManager.Instance.Phase != GamePhase.Play || !_logic)
                     return;
 
                 try {
                     Player player = null;
                     Stick stick = SystemFunc.GetStick(collision.gameObject);
                     if (!stick) {
-                        PlayerBodyV2 playerBody = SystemFunc.GetPlayerBodyV2(collision.gameObject);
+                        PlayerBody playerBody = SystemFunc.GetPlayerBody(collision.gameObject);
                         if (!playerBody || !playerBody.Player)
                             return;
 
@@ -1600,7 +1829,7 @@ namespace oomtm450PuckMod_Stats {
                         player = stick.Player;
                     }
 
-                    string currentPlayerSteamId = player.SteamId.Value.ToString();
+                    string currentPlayerSteamId = player.SteamId.Value.Value;
 
                     // Track puck touches - only count when first touching (OnCollisionEnter)
                     // Handle stick touches for both skaters and goalies
@@ -1645,7 +1874,7 @@ namespace oomtm450PuckMod_Stats {
                         lastTimeCollisionExitWatch.Start();
                         _lastTimeOnCollisionStayOrExitWasCalled.Add(currentPlayerSteamId, lastTimeCollisionExitWatch);
                     }
-                    else if (lastTimeCollisionExitWatch.ElapsedMilliseconds > ServerConfig.MaxPossessionMilliseconds || (!string.IsNullOrEmpty(lastPlayerOnPuckTipIncludedSteamId) && lastPlayerOnPuckTipIncludedSteamId != currentPlayerSteamId)) {
+                    else if (lastTimeCollisionExitWatch.ElapsedMilliseconds > ModServerConfig.MaxPossessionMilliseconds || (!string.IsNullOrEmpty(lastPlayerOnPuckTipIncludedSteamId) && lastPlayerOnPuckTipIncludedSteamId != currentPlayerSteamId)) {
                         watch.Restart();
 
                         if (!string.IsNullOrEmpty(lastPlayerOnPuckTipIncludedSteamId) && lastPlayerOnPuckTipIncludedSteamId != currentPlayerSteamId) {
@@ -1654,22 +1883,23 @@ namespace oomtm450PuckMod_Stats {
                         }
                     }
 
-                    PlayerTeam otherTeam = TeamFunc.GetOtherTeam(player.Team.Value);
+                    PlayerTeam otherTeam = TeamFunc.GetOtherTeam(player.Team);
 
-                    if (_puckRaycast.PuckIsGoingToNet[player.Team.Value]) {
+                    if (_puckRaycast.PuckIsGoingToNet[player.Team]) {
                         if (PlayerFunc.IsGoalie(player) && Math.Abs(player.PlayerBody.Rigidbody.transform.position.z) > 13.5) {
                             PlayerTeam shooterTeam = otherTeam;
                             string shooterSteamId = _lastPlayerOnPuckTipIncludedSteamId[shooterTeam].SteamId;
                             if (!string.IsNullOrEmpty(shooterSteamId)) {
-                                // Check if a SaveCheck already exists - if so, preserve stick hit status (OR logic)
-                                // This prevents body saves from being counted multiple times when puck hits multiple body parts
+                                // Track whether the save involved the stick or body.
+                                // Body contact takes priority: if body was touched at ANY point, classify as body save.
+                                // Only classify as stick save when the stick is the sole contact throughout.
                                 bool hitStick = stick != null;
-                                if (_checkIfPuckWasSaved.TryGetValue(player.Team.Value, out SaveCheck existingCheck) && existingCheck.HasToCheck) {
-                                    // Preserve stick hit if any collision was with stick
-                                    hitStick = existingCheck.HitStick || hitStick;
+                                if (_checkIfPuckWasSaved.TryGetValue(player.Team, out SaveCheck existingCheck) && existingCheck.HasToCheck) {
+                                    // AND logic: both current AND previous contact must be stick-only for HitStick to stay true
+                                    hitStick = existingCheck.HitStick && hitStick;
                                 }
                                 
-                                _checkIfPuckWasSaved[player.Team.Value] = new SaveCheck {
+                                _checkIfPuckWasSaved[player.Team] = new SaveCheck {
                                     HasToCheck = true,
                                     ShooterSteamId = shooterSteamId,
                                     ShooterTeam = shooterTeam,
@@ -1684,9 +1914,9 @@ namespace oomtm450PuckMod_Stats {
                             PlayerTeam shooterTeam = otherTeam;
                             string shooterSteamId = _lastPlayerOnPuckTipIncludedSteamId[shooterTeam].SteamId;
                             if (!string.IsNullOrEmpty(shooterSteamId)) {
-                                _checkIfPuckWasBlocked[player.Team.Value] = new BlockCheck {
+                                _checkIfPuckWasBlocked[player.Team] = new BlockCheck {
                                     HasToCheck = true,
-                                    BlockerSteamId = player.SteamId.Value.ToString(),
+                                    BlockerSteamId = player.SteamId.Value.Value,
                                     ShooterTeam = shooterTeam,
                                     BlockGameTime = GetCurrentGameTime(), // Store the game time when block check is set up
                                 };
@@ -1695,10 +1925,10 @@ namespace oomtm450PuckMod_Stats {
                     }
                     else {
                         if (_lastTeamOnPuckTipIncluded == otherTeam && PlayerFunc.IsGoalie(player) && Math.Abs(player.PlayerBody.Rigidbody.transform.position.z) > 13.5) {
-                            if ((player.Team.Value == PlayerTeam.Blue && _puckZCoordinateDifference > ServerConfig.GoalieSaveCreaseSystemZDelta) || (player.Team.Value == PlayerTeam.Red && _puckZCoordinateDifference < -ServerConfig.GoalieSaveCreaseSystemZDelta)) {
+                            if ((player.Team == PlayerTeam.Blue && _puckZCoordinateDifference > ModServerConfig.GoalieSaveCreaseSystemZDelta) || (player.Team == PlayerTeam.Red && _puckZCoordinateDifference < -ModServerConfig.GoalieSaveCreaseSystemZDelta)) {
                                 (double startX, double endX) = (0, 0);
                                 (double startZ, double endZ) = (0, 0);
-                                if (player.Team.Value == PlayerTeam.Blue) {
+                                if (player.Team == PlayerTeam.Blue) {
                                     (startX, endX) = ZoneFunc.ICE_X_POSITIONS[IceElement.BlueTeam_BluePaint];
                                     (startZ, endZ) = ZoneFunc.ICE_Z_POSITIONS[IceElement.BlueTeam_BluePaint];
                                 }
@@ -1708,26 +1938,25 @@ namespace oomtm450PuckMod_Stats {
                                 }
 
                                 bool goalieIsInHisCrease = true;
-                                if (player.PlayerBody.Rigidbody.transform.position.x - ServerConfig.GoalieRadius < startX ||
-                                    player.PlayerBody.Rigidbody.transform.position.x + ServerConfig.GoalieRadius > endX ||
-                                    player.PlayerBody.Rigidbody.transform.position.z - ServerConfig.GoalieRadius < startZ ||
-                                    player.PlayerBody.Rigidbody.transform.position.z + ServerConfig.GoalieRadius > endZ) {
+                                if (player.PlayerBody.Rigidbody.transform.position.x - ModServerConfig.GoalieRadius < startX ||
+                                    player.PlayerBody.Rigidbody.transform.position.x + ModServerConfig.GoalieRadius > endX ||
+                                    player.PlayerBody.Rigidbody.transform.position.z - ModServerConfig.GoalieRadius < startZ ||
+                                    player.PlayerBody.Rigidbody.transform.position.z + ModServerConfig.GoalieRadius > endZ) {
                                     goalieIsInHisCrease = false;
                                 }
 
                                 if (goalieIsInHisCrease) {
-                                    PlayerTeam shooterTeam = TeamFunc.GetOtherTeam(player.Team.Value);
+                                    PlayerTeam shooterTeam = TeamFunc.GetOtherTeam(player.Team);
                                     string shooterSteamId = _lastPlayerOnPuckTipIncludedSteamId[shooterTeam].SteamId;
                                     if (!string.IsNullOrEmpty(shooterSteamId)) {
-                                        // Check if a SaveCheck already exists - if so, preserve stick hit status (OR logic)
-                                        // This prevents body saves from being counted multiple times when puck hits multiple body parts
+                                        // Body contact takes priority over stick: only a stick save when stick is sole contact throughout.
                                         bool hitStick = stick != null;
-                                        if (_checkIfPuckWasSaved.TryGetValue(player.Team.Value, out SaveCheck existingCheck) && existingCheck.HasToCheck) {
-                                            // Preserve stick hit if any collision was with stick
-                                            hitStick = existingCheck.HitStick || hitStick;
+                                        if (_checkIfPuckWasSaved.TryGetValue(player.Team, out SaveCheck existingCheck) && existingCheck.HasToCheck) {
+                                            // AND logic: body touching at any point overrides stick classification
+                                            hitStick = existingCheck.HitStick && hitStick;
                                         }
                                         
-                                        _checkIfPuckWasSaved[player.Team.Value] = new SaveCheck {
+                                        _checkIfPuckWasSaved[player.Team] = new SaveCheck {
                                             HasToCheck = true,
                                             ShooterSteamId = shooterSteamId,
                                             ShooterTeam = shooterTeam,
@@ -1740,7 +1969,7 @@ namespace oomtm450PuckMod_Stats {
                     }
                 }
                 catch (Exception ex) {
-                    Logging.LogError($"Error in Puck_OnCollisionEnter_Patch Postfix().\n{ex}", ServerConfig);
+                    Logging.LogError($"Error in Puck_OnCollisionEnter_Patch Postfix().\n{ex}", ModServerConfig);
                 }
             }
         }
@@ -1754,14 +1983,14 @@ namespace oomtm450PuckMod_Stats {
             public static void Postfix(Collision collision) {
                 try {
                     // If this is not the server or game is not started, do not use the patch.
-                    if (!ServerFunc.IsDedicatedServer() || _paused || GameManager.Instance.Phase != GamePhase.Playing || !_logic)
+                    if (!ServerFunc.IsDedicatedServer() || _paused || GameManager.Instance.Phase != GamePhase.Play || !_logic)
                         return;
 
                     Player player;
 
                     Stick stick = SystemFunc.GetStick(collision.gameObject);
                     if (!stick) {
-                        PlayerBodyV2 playerBody = SystemFunc.GetPlayerBodyV2(collision.gameObject);
+                        PlayerBody playerBody = SystemFunc.GetPlayerBody(collision.gameObject);
                         if (!playerBody || !playerBody.Player)
                             return;
 
@@ -1774,7 +2003,7 @@ namespace oomtm450PuckMod_Stats {
                         player = stick.Player;
                     }
 
-                    string playerSteamId = player.SteamId.Value.ToString();
+                    string playerSteamId = player.SteamId.Value.Value;
 
                     // Possession time is now only tracked in OnCollisionEnter (between consecutive touches)
                     // No need to track in OnCollisionStay
@@ -1786,20 +2015,20 @@ namespace oomtm450PuckMod_Stats {
                     }
                     lastTimeCollisionWatch.Restart();
 
-                    string lastPlayerOnPuckTipIncluded = _lastPlayerOnPuckTipIncludedSteamId[player.Team.Value].SteamId;
+                    string lastPlayerOnPuckTipIncluded = _lastPlayerOnPuckTipIncludedSteamId[player.Team].SteamId;
 
                     // Note: Pass/Reception events are now created in real-time in ProcessPuckTouch
                     // when a new player on the same team touches the puck, converting the previous
                     // player's last Touch to a Pass and recording the current touch as a Reception
                     
                     if (playerSteamId != lastPlayerOnPuckTipIncluded) {
-                        _lastPlayerOnPuckTipIncludedSteamId[player.Team.Value] = (playerSteamId, DateTime.UtcNow);
+                        _lastPlayerOnPuckTipIncludedSteamId[player.Team] = (playerSteamId, DateTime.UtcNow);
                     }
 
-                    _lastTeamOnPuckTipIncluded = player.Team.Value;
+                    _lastTeamOnPuckTipIncluded = player.Team;
 
                     // Puck battle tracking - detect when puck is tipped (multiple sticks contacting simultaneously)
-                    bool isTipped = PuckFunc.PuckIsTipped(playerSteamId, ServerConfig.MaxTippedMilliseconds, _playersCurrentPuckTouch, _lastTimeOnCollisionStayOrExitWasCalled);
+                    bool isTipped = PuckFunc.PuckIsTipped(playerSteamId, ModServerConfig.MaxTippedMilliseconds, _playersCurrentPuckTouch, _lastTimeOnCollisionStayOrExitWasCalled);
                     
                     // Detect puck battle when tip starts (two sticks contacting puck simultaneously)
                     if (isTipped && !_wasTippedLastFrame) {
@@ -1815,17 +2044,17 @@ namespace oomtm450PuckMod_Stats {
                             if (touchingPlayer != null && touchingPlayer && !PlayerFunc.IsGoalie(touchingPlayer)) {
                                 // Check if this player is actively touching (stopwatch is running and recent)
                                 // If the stopwatch elapsed time is very small, they're actively touching
-                                if (kvp.Value.IsRunning && kvp.Value.ElapsedMilliseconds < ServerConfig.MaxTippedMilliseconds * 2) {
+                                if (kvp.Value.IsRunning && kvp.Value.ElapsedMilliseconds < ModServerConfig.MaxTippedMilliseconds * 2) {
                                     // Also check if they haven't exited recently
                                     if (_lastTimeOnCollisionStayOrExitWasCalled.TryGetValue(touchingSteamId, out Stopwatch exitWatch)) {
-                                        if (exitWatch.IsRunning && exitWatch.ElapsedMilliseconds < ServerConfig.MaxTippedMilliseconds * 2) {
+                                        if (exitWatch.IsRunning && exitWatch.ElapsedMilliseconds < ModServerConfig.MaxTippedMilliseconds * 2) {
                                             playersTouchingPuck.Add(touchingSteamId);
-                                            teamsTouchingPuck.Add(touchingPlayer.Team.Value);
+                                            teamsTouchingPuck.Add(touchingPlayer.Team);
                                         }
                                     } else {
                                         // If no exit watch, assume they're touching
                                         playersTouchingPuck.Add(touchingSteamId);
-                                        teamsTouchingPuck.Add(touchingPlayer.Team.Value);
+                                        teamsTouchingPuck.Add(touchingPlayer.Team);
                                     }
                                 }
                             }
@@ -1871,7 +2100,7 @@ namespace oomtm450PuckMod_Stats {
                                         Player battlePlayer = PlayerManager.Instance.GetPlayerBySteamId(battleSteamId);
                                         if (battlePlayer != null && battlePlayer) {
                                             // Determine flag: "defending" if on defending team, "contesting" if on contesting team
-                                            string battleFlag = battlePlayer.Team.Value == defendingTeam ? "defending" : "contesting";
+                                            string battleFlag = battlePlayer.Team == defendingTeam ? "defending" : "contesting";
                                             
                                             // Record puck battle event - this does NOT reset possession chains
                                             // Pass defending team as teamInPossessionOverride to ensure correct TeamInPossession for both players
@@ -1886,8 +2115,8 @@ namespace oomtm450PuckMod_Stats {
                     }
                     
                     if (!isTipped) {
-                        _lastTeamOnPuck = player.Team.Value;
-                        _lastPlayerOnPuckSteamId[player.Team.Value] = (playerSteamId, DateTime.UtcNow);
+                        _lastTeamOnPuck = player.Team;
+                        _lastPlayerOnPuckSteamId[player.Team] = (playerSteamId, DateTime.UtcNow);
                     }
                     
                     _wasTippedLastFrame = isTipped;
@@ -1906,17 +2135,17 @@ namespace oomtm450PuckMod_Stats {
                     bool shouldUpdatePossession = true;
                     if (_lastEvent != null && _lastEvent.EventType == PlayByPlayEventType.Touch && 
                         _lastEvent.Outcome == "failed" && 
-                        _lastEvent.PlayerTeam != (int)player.Team.Value &&
+                        _lastEvent.PlayerTeam != (int)player.Team &&
                         _lastPossession.Team != PlayerTeam.None && 
-                        _lastPossession.Team != player.Team.Value) {
+                        _lastPossession.Team != player.Team) {
                         // Last event was a failed touch from opposing team - don't update possession
                         // Keep the previous team's possession until a successful touch occurs
                         shouldUpdatePossession = false;
                     }
                     
                     if (shouldUpdatePossession) {
-                        string currentPossessionSteamId = PlayerFunc.GetPlayerSteamIdInPossession(ServerConfig.MinPossessionMilliseconds, ServerConfig.MaxPossessionMilliseconds,
-                        ServerConfig.MaxTippedMilliseconds, _playersLastTimePuckPossession, _playersCurrentPuckTouch, true);
+                        string currentPossessionSteamId = PlayerFunc.GetPlayerSteamIdInPossession(ModServerConfig.MinPossessionMilliseconds, ModServerConfig.MaxPossessionMilliseconds,
+                        ModServerConfig.MaxTippedMilliseconds, _playersLastTimePuckPossession, _playersCurrentPuckTouch, true);
                         if (!string.IsNullOrEmpty(currentPossessionSteamId)) {
                             // Track possession start time for new possession
                             if (!_possessionStartTime.ContainsKey(currentPossessionSteamId)) {
@@ -1925,7 +2154,7 @@ namespace oomtm450PuckMod_Stats {
 
                             _lastPossession = new Possession {
                                 SteamId = currentPossessionSteamId,
-                                Team = player.Team.Value,
+                                Team = player.Team,
                                 Date = DateTime.UtcNow,
                             };
                         } else {
@@ -1938,7 +2167,7 @@ namespace oomtm450PuckMod_Stats {
                     UpdateTeamPossessionTime(_lastPossession.Team);
                 }
                 catch (Exception ex) {
-                    Logging.LogError($"Error in Puck_OnCollisionStay_Patch Postfix().\n{ex}", ServerConfig);
+                    Logging.LogError($"Error in Puck_OnCollisionStay_Patch Postfix().\n{ex}", ModServerConfig);
                 }
             }
         }
@@ -1952,22 +2181,23 @@ namespace oomtm450PuckMod_Stats {
             public static void Postfix(Puck __instance, Collision collision) {
                 try {
                     // If this is not the server or game is not started, do not use the patch.
-                    if (!ServerFunc.IsDedicatedServer() || _paused || GameManager.Instance.Phase != GamePhase.Playing || !_logic)
+                    if (!ServerFunc.IsDedicatedServer() || _paused || GameManager.Instance.Phase != GamePhase.Play || !_logic)
                         return;
 
                     Stick stick = SystemFunc.GetStick(collision.gameObject);
                     if (!stick)
                         return;
 
-                    string playerSteamId = stick.Player.SteamId.Value.ToString();
+                    string playerSteamId = stick.Player.SteamId.Value.Value;
                     Player player = stick.Player;
 
                     // Record shot attempts when puck leaves a player's stick (if it meets shot criteria)
                     // Only reset _lastShotWasCounted for non-goalies releasing the puck (new shot attempts)
                     // This prevents resetting the flag when goalie touches puck after a save, which would cause duplicate save counting
                     if (!__instance.IsTouchingStick && !PlayerFunc.IsGoalie(player)) {
-                        _lastShotWasCounted[stick.Player.Team.Value] = false;
-                        _lastBlockWasCounted[stick.Player.Team.Value] = false;
+                        _lastShotWasCounted[stick.Player.Team] = false;
+                        _lastBlockWasCounted[stick.Player.Team] = false;
+                        _savePercDuringGoalProcessed[stick.Player.Team] = false; // new shot cycle — allow next goal to update save%
                         
                         Puck shotPuck = PuckManager.Instance?.GetPuck();
                         if (player != null && player && shotPuck != null) {
@@ -1981,7 +2211,7 @@ namespace oomtm450PuckMod_Stats {
                             // Note: Zone filter removed - shots can come from anywhere
                             // Blue team shoots from negative Z toward Red's goal at z=-40 (moving more negative)
                             // Red team shoots from positive Z toward Blue's goal at z=40 (moving more positive)
-                            bool isBlueTeam = (player.Team.Value == PlayerTeam.Blue);
+                            bool isBlueTeam = (player.Team == PlayerTeam.Blue);
                             bool movingTowardsNet = isBlueTeam ? (puckVel.z < 0) : (puckVel.z > 0);
                             
                             // Issue #3: Verify shot is going towards OPPONENT's net, not own net
@@ -2039,11 +2269,11 @@ namespace oomtm450PuckMod_Stats {
                                     float dotProduct = Vector3.Dot(normalizedDirectionToNet, normalizedVelocity);
                                     
                                     // Use tighter angle threshold for shots beyond 50 units
-                                    // Standard threshold: 18-degree threshold: cos(18°) ≈ 0.951
-                                    // Tighter threshold for distance shots: 12-degree threshold: cos(12°) ≈ 0.978
+                                    // Standard threshold: 18-degree threshold: cos(18?) ? 0.951
+                                    // Tighter threshold for distance shots: 12-degree threshold: cos(12?) ? 0.978
                                     const float ANGLE_DISTANCE_THRESHOLD = 50.0f; // Distance threshold for tighter angle requirement
-                                    const float MIN_ALIGNMENT_DOT_STANDARD = 0.951f; // cos(18°) - for shots within 50 units
-                                    const float MIN_ALIGNMENT_DOT_DISTANCE = 0.978f; // cos(12°) - for shots beyond 50 units
+                                    const float MIN_ALIGNMENT_DOT_STANDARD = 0.951f; // cos(18?) - for shots within 50 units
+                                    const float MIN_ALIGNMENT_DOT_DISTANCE = 0.978f; // cos(12?) - for shots beyond 50 units
                                     
                                     float minAlignmentDot = distanceToNet > ANGLE_DISTANCE_THRESHOLD 
                                         ? MIN_ALIGNMENT_DOT_DISTANCE 
@@ -2068,7 +2298,7 @@ namespace oomtm450PuckMod_Stats {
                             // Issue #4: Only count if player releases possession (no further touch events)
                             // Check if this player was the last one to touch the puck - if so, they're releasing it
                             bool playerReleasingPossession = false;
-                            if (_lastPlayerOnPuckTipIncludedSteamId.TryGetValue(player.Team.Value, out var lastTouchInfo)) {
+                            if (_lastPlayerOnPuckTipIncludedSteamId.TryGetValue(player.Team, out var lastTouchInfo)) {
                                 // If this player was the last to touch, they're releasing possession
                                 playerReleasingPossession = (lastTouchInfo.SteamId == playerSteamId);
                             }
@@ -2082,7 +2312,7 @@ namespace oomtm450PuckMod_Stats {
                             
                             if (puckSpeed >= minRequiredVelocity && movingTowardsNet && movingTowardsOpponentNet && velocityAlignedWithNet && playerReleasingPossession && (lastShotGameTime < 0f || secondsSinceLastShot >= SHOT_ATTEMPT_COOLDOWN_SECONDS)) {
                                 // Determine shot flag (HomePlate or Outside) based on puck position
-                                string shotFlag = DetermineShotFlag(puckPos, player.Team.Value);
+                                string shotFlag = DetermineShotFlag(puckPos, player.Team);
                                 // Record shot attempt with "attempt" outcome (will be updated to "on net" or "missed" based on raycast)
                                 RecordPlayByPlayEventInternal(PlayByPlayEventType.Shot, player, puckPos, puckVel, "attempt", shotFlag);
                                 
@@ -2093,10 +2323,10 @@ namespace oomtm450PuckMod_Stats {
                                 QueueStatUpdate(Codebase.Constants.SHOT_ATTEMPTS + playerSteamId, _shotAttempts[playerSteamId].ToString());
                                 
                                 // Track team shot attempts
-                                if (!_teamShotAttempts.TryGetValue(player.Team.Value, out int _))
-                                    _teamShotAttempts.Add(player.Team.Value, 0);
-                                _teamShotAttempts[player.Team.Value] += 1;
-                                QueueStatUpdate(Codebase.Constants.TEAM_SHOT_ATTEMPTS + player.Team.Value.ToString(), _teamShotAttempts[player.Team.Value].ToString());
+                                if (!_teamShotAttempts.TryGetValue(player.Team, out int _))
+                                    _teamShotAttempts.Add(player.Team, 0);
+                                _teamShotAttempts[player.Team] += 1;
+                                QueueStatUpdate(Codebase.Constants.TEAM_SHOT_ATTEMPTS + player.Team.ToString(), _teamShotAttempts[player.Team].ToString());
                                 
                                 // Update last shot attempt game time for cooldown (per player)
                                 _lastShotAttemptGameTime[playerSteamId] = currentGameTime;
@@ -2105,7 +2335,7 @@ namespace oomtm450PuckMod_Stats {
                             // Store release info - will be used if raycast confirms (for on-net shots)
                             // Only store if we actually recorded a shot attempt, to prevent duplicates
                             if (puckSpeed >= MIN_SHOT_VELOCITY && movingTowardsNet && movingTowardsOpponentNet && velocityAlignedWithNet && playerReleasingPossession && (lastShotGameTime < 0f || secondsSinceLastShot >= SHOT_ATTEMPT_COOLDOWN_SECONDS)) {
-                                _pendingShotReleases[player.Team.Value] = (playerSteamId, shooterPos, puckPos, puckVel, DateTime.UtcNow);
+                                _pendingShotReleases[player.Team] = (playerSteamId, shooterPos, puckPos, puckVel, DateTime.UtcNow);
                             }
                         }
                     }
@@ -2122,16 +2352,16 @@ namespace oomtm450PuckMod_Stats {
                     }
                     lastTimeCollisionWatch.Restart();
 
-                    _lastPlayerOnPuckTipIncludedSteamId[stick.Player.Team.Value] = (playerSteamId, DateTime.UtcNow);
-                    _lastTeamOnPuckTipIncluded = stick.Player.Team.Value;
+                    _lastPlayerOnPuckTipIncludedSteamId[stick.Player.Team] = (playerSteamId, DateTime.UtcNow);
+                    _lastTeamOnPuckTipIncluded = stick.Player.Team;
 
-                    if (!PuckFunc.PuckIsTipped(playerSteamId, ServerConfig.MaxTippedMilliseconds, _playersCurrentPuckTouch, _lastTimeOnCollisionStayOrExitWasCalled)) {
-                        _lastTeamOnPuck = stick.Player.Team.Value;
-                        _lastPlayerOnPuckSteamId[stick.Player.Team.Value] = (playerSteamId, DateTime.UtcNow);
+                    if (!PuckFunc.PuckIsTipped(playerSteamId, ModServerConfig.MaxTippedMilliseconds, _playersCurrentPuckTouch, _lastTimeOnCollisionStayOrExitWasCalled)) {
+                        _lastTeamOnPuck = stick.Player.Team;
+                        _lastPlayerOnPuckSteamId[stick.Player.Team] = (playerSteamId, DateTime.UtcNow);
                     }
                 }
                 catch (Exception ex) {
-                    Logging.LogError($"Error in Puck_OnCollisionExit_Patch Postfix().\n{ex}", ServerConfig);
+                    Logging.LogError($"Error in Puck_OnCollisionExit_Patch Postfix().\n{ex}", ModServerConfig);
                 }
             }
         }
@@ -2140,37 +2370,37 @@ namespace oomtm450PuckMod_Stats {
         /// <summary>
         /// Class that patches the OnCollisionEnter event from PlayerBodyV2.
         /// </summary>
-        [HarmonyPatch(typeof(PlayerBodyV2), "OnCollisionEnter")]
+        [HarmonyPatch(typeof(PlayerBody), "OnCollisionEnter")]
         public class PlayerBodyV2_OnCollisionEnter_Patch {
             [HarmonyPostfix]
-            public static void Postfix(PlayerBodyV2 __instance, Collision collision) {
+            public static void Postfix(PlayerBody __instance, Collision collision) {
                 // If this is not the server or game is not started, do not use the patch.
-                if (!ServerFunc.IsDedicatedServer() || _paused || GameManager.Instance.Phase != GamePhase.Playing || !_logic)
+                if (!ServerFunc.IsDedicatedServer() || _paused || GameManager.Instance.Phase != GamePhase.Play || !_logic)
                     return;
 
                 try {
                     if (collision.gameObject.layer != LayerMask.NameToLayer("Player"))
                         return;
 
-                    PlayerBodyV2 collisionPlayerBody = SystemFunc.GetPlayerBodyV2(collision.gameObject);
+                    PlayerBody collisionPlayerBody = SystemFunc.GetPlayerBody(collision.gameObject);
 
-                    if (!collisionPlayerBody || !collisionPlayerBody.Player || !collisionPlayerBody.Player.IsCharacterFullySpawned)
+                    if (!collisionPlayerBody || !collisionPlayerBody.Player || !collisionPlayerBody.Player.IsCharacterSpawned)
                         return;
 
-                    if (!__instance || !__instance.Player || !__instance.Player.IsCharacterFullySpawned)
+                    if (!__instance || !__instance.Player || !__instance.Player.IsCharacterSpawned)
                         return;
 
                     //float force = Utils.GetCollisionForce(collision);
 
                     // If the player has been hit by the same team, return;
-                    if (collisionPlayerBody.Player.Team.Value == __instance.Player.Team.Value)
+                    if (collisionPlayerBody.Player.Team == __instance.Player.Team)
                         return;
 
-                    string collisionPlayerBodySteamId = collisionPlayerBody.Player.SteamId.Value.ToString();
+                    string collisionPlayerBodySteamId = collisionPlayerBody.Player.SteamId.Value.Value;
                     if (!_playerIsDown.TryGetValue(collisionPlayerBodySteamId, out bool collisionPlayerBodyIsDown))
                         collisionPlayerBodyIsDown = false;
 
-                    string instancePlayerSteamId = __instance.Player.SteamId.Value.ToString();
+                    string instancePlayerSteamId = __instance.Player.SteamId.Value.Value;
 
                     if (!collisionPlayerBodyIsDown && (collisionPlayerBody.HasFallen || collisionPlayerBody.HasSlipped)) {
                         if (_playerIsDown.TryGetValue(collisionPlayerBodySteamId, out bool _))
@@ -2187,7 +2417,7 @@ namespace oomtm450PuckMod_Stats {
                             return;
                         }
 
-                        ProcessHit(__instance.Player.SteamId.Value.ToString(), collisionPlayerBody.Player.SteamId.Value.ToString());
+                        ProcessHit(__instance.Player.SteamId.Value.Value, collisionPlayerBody.Player.SteamId.Value.Value);
                     }
 
                     if (__instance.Player.PlayerBody.HasFallen || __instance.Player.PlayerBody.HasSlipped) {
@@ -2198,7 +2428,7 @@ namespace oomtm450PuckMod_Stats {
                     }
                 }
                 catch (Exception ex) {
-                    Logging.LogError($"Error in {nameof(PlayerBodyV2_OnCollisionEnter_Patch)} Postfix().\n{ex}", ServerConfig);
+                    Logging.LogError($"Error in {nameof(PlayerBodyV2_OnCollisionEnter_Patch)} Postfix().\n{ex}", ModServerConfig);
                 }
 
                 return;
@@ -2209,23 +2439,23 @@ namespace oomtm450PuckMod_Stats {
         /// <summary>
         /// Class that patches the OnStandUp event from PlayerBodyV2.
         /// </summary>
-        [HarmonyPatch(typeof(PlayerBodyV2), nameof(PlayerBodyV2.OnStandUp))]
+        [HarmonyPatch(typeof(PlayerBody), nameof(PlayerBody.OnStandUp))]
         public class PlayerBodyV2_OnStandUp_Patch {
             [HarmonyPostfix]
-            public static void Postfix(PlayerBodyV2 __instance) {
+            public static void Postfix(PlayerBody __instance) {
                 // If this is not the server or game is not started, do not use the patch.
-                if (!ServerFunc.IsDedicatedServer() || _paused || GameManager.Instance.Phase != GamePhase.Playing || !_logic)
+                if (!ServerFunc.IsDedicatedServer() || _paused || GameManager.Instance.Phase != GamePhase.Play || !_logic)
                     return;
 
                 try {
-                    string playerSteamId = __instance.Player.SteamId.Value.ToString();
+                    string playerSteamId = __instance.Player.SteamId.Value.Value;
                     if (_playerIsDown.TryGetValue(playerSteamId, out bool _))
                         _playerIsDown[playerSteamId] = false;
                     else
                         _playerIsDown.Add(playerSteamId, false);
                 }
                 catch (Exception ex) {
-                    Logging.LogError($"Error in {nameof(PlayerBodyV2_OnStandUp_Patch)} Postfix().\n{ex}", ServerConfig);
+                    Logging.LogError($"Error in {nameof(PlayerBodyV2_OnStandUp_Patch)} Postfix().\n{ex}", ModServerConfig);
                 }
 
                 return;
@@ -2233,550 +2463,667 @@ namespace oomtm450PuckMod_Stats {
         }
 
         /// <summary>
-        /// Class that patches the Server_SetPhase event from GameManager.
+        /// Event handler called when the game state changes.
+        /// Replaces the Server_SetPhase Harmony patch (method removed in B310); handles
+        /// phase transitions for play-by-play tracking, early-export logic, and cleanup.
         /// </summary>
-        [HarmonyPatch(typeof(GameManager), nameof(GameManager.Server_SetPhase))]
-        public class GameManager_Server_SetPhase_Patch {
-            [HarmonyPrefix]
-            public static bool Prefix(GameManager __instance, GamePhase phase, ref int time) {
-                try {
-                    // If this is not the server, do not use the patch.
-                    if (!ServerFunc.IsDedicatedServer() || !_logic)
-                        return true;
+        public static void Event_Everyone_OnGameStateChanged(Dictionary<string, object> message) {
+            try {
+                if (!ServerFunc.IsDedicatedServer() || !_logic)
+                    return;
 
-                    if (phase == GamePhase.FaceOff || phase == GamePhase.Warmup || phase == GamePhase.GameOver) {
-                        ResetPuckWasSavedOrBlockedChecks();
+                GameState newGameState = (GameState)message["newGameState"];
+                GamePhase phase = newGameState.Phase;
+#if DEBUG_MODE
+                if (phase != _lastRecordedPhase) {
+                    DebugTrace.Section($"GAME_STATE  {_lastRecordedPhase} -> {phase}");
+                    DebugTrace.Write("GAME_STATE", $"Phase changed: {_lastRecordedPhase} -> {phase}  pbpEvents={_playByPlayEvents.Count}  goals={_goals.Count}  RedScore={newGameState.RedScore}  BlueScore={newGameState.BlueScore}");
+                    DebugTrace.Flush();
+                }
+#endif
+                if (phase == GamePhase.PreGame && _lastRecordedPhase != GamePhase.PreGame) {
+                    // PreGame always marks a new game (vote reset, lobby countdown, FaceOff -> PreGame, etc.).
+                    // Server-side wipe only; clients sync on PreGame -> FaceOff (no broadcast here).
+                    if (_lastRecordedPhase == GamePhase.Play)
+                        TryExportAbortedGameStats("Game ended early.");
 
-                        _puckLastCoordinate = Vector3.zero;
-                        _puckZCoordinateDifference = 0;
+                    ResetAllServerStatsAndPlayByPlay();
+                    _gameOverBlockEntered = false;
+                    _exportedAtGameOver = false;
+                    _exportedAtResetGameState = false;
 
-                        // Initialize play-by-play tracking
-                        if (phase == GamePhase.FaceOff) {
-                            // Only reset if this is the start of a new game (not a period transition)
-                            bool isNewGame = (_gameStartTime == 0f || _playByPlayEvents.Count == 0);
-                            if (isNewGame) {
-                                _gameStartTime = Time.time;
-                                _currentPeriod = 1;
-                                _lastTrackedPeriod = 0; // Initialize period tracking
-                                _nextPlayByPlayEventId = 0;
-                                _playByPlayEvents.Clear();
-                                _lastProcessedZoneFlagEventId = -1; // Reset zone flag scanner
-                                _currentGameReferenceId = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
-                                _currentTeamInPossession = PlayerTeam.None;
-                                _currentPlayInPossession = 0;
-                                
-                                // Reset game time tracking for fractional precision
-                                _lastWholeSecondGameTime = 0f;
-                                _lastUnityTimeForGameTime = 0f;
-                                _lastCountdownValue = -1;
-                                
-                                // Reset tooltips when new game begins (same timing as goals/assists reset)
-                                // Clear pending stat updates before sending reset
-                                _pendingStatUpdates.Clear();
-                                SafeSendDataToAll(RESET_ALL, "1");
+                    _lastRecordedPhase = GamePhase.PreGame;
+                }
+                else if (phase == GamePhase.FaceOff || phase == GamePhase.Warmup || phase == GamePhase.GameOver) {
+                    ResetPuckWasSavedOrBlockedChecks();
+
+                    _puckLastCoordinate = Vector3.zero;
+                    _puckZCoordinateDifference = 0;
+
+                    // Initialize play-by-play tracking
+                    if (phase == GamePhase.FaceOff) {
+                        // New game = Warmup -> FaceOff, GameOver -> FaceOff, or Playing -> FaceOff (restart without replay/intermission). In-game faceoff after goal = Playing -> Replay -> FaceOff.
+                        bool isNewGame = (_lastRecordedPhase == GamePhase.Warmup || _lastRecordedPhase == GamePhase.GameOver || _lastRecordedPhase == GamePhase.Play);
+                        if (isNewGame) {
+                            // GameOver -> FaceOff safety net: the GameOver block should have already exported
+                            // (and set _exportedAtGameOver = true) before we reach here. But if it didn't —
+                            // e.g. an exception fired in the GameOver handler, or the phase transitioned so
+                            // fast that the GameOver event never fired independently — we attempt a recovery
+                            // export here before RESET_ALL wipes the data below.
+                            if (_lastRecordedPhase == GamePhase.GameOver && !_exportedAtGameOver && !_exportedAtResetGameState && _playByPlayEvents.Count > 0) {
+                                int uniquePlayerCount = 0;
+                                int eventCount = _playByPlayEvents.Count;
+                                try {
+                                    uniquePlayerCount = _playByPlayEvents.Where(e => !string.IsNullOrEmpty(e.PlayerSteamId)).Select(e => e.PlayerSteamId).Distinct().Count();
+                                } catch { }
+                                bool meetsCriteria = !ModServerConfig.EnableExportLimit || (uniquePlayerCount >= 8 && eventCount >= 300);
+                                if (meetsCriteria) {
+                                    Logging.Log($"GameOver->FaceOff safety net: GameOver block did not export — exporting now before reset", ModServerConfig);
+                                    bool hasGameEndEvent = _playByPlayEvents.Any(e => e.EventType == PlayByPlayEventType.GameEnd);
+                                    if (!hasGameEndEvent) {
+                                        int finalPeriod = GetCurrentPeriod();
+                                        float maxGameTime = _playByPlayEvents.Count > 0 ? _playByPlayEvents.Max(e => e.GameTime) : 0f;
+                                        float gameEndGameTime = maxGameTime > 0f ? maxGameTime : GetCurrentGameTime();
+                                        var gameEndEvent = new PlayByPlayEvent { EventId = _nextPlayByPlayEventId++, EventType = PlayByPlayEventType.GameEnd, GameTime = gameEndGameTime, Period = finalPeriod, PlayerSteamId = "", PlayerName = "", PlayerTeam = 0, PlayerPosition = "", PlayerJersey = 0, PlayerSpeed = 0f, Zone = EventZone.Neutral, Position = Vector3.zero, Velocity = Vector3.zero, ForceMagnitude = 0f, Outcome = "end", Flags = "", Team = "", TeamInPossession = _currentTeamInPossession != PlayerTeam.None ? (_currentTeamInPossession == PlayerTeam.Blue ? "Blue" : "Red") : "", CurrentPlayInPossession = _currentPlayInPossession.ToString(), ScoreState = GetScoreState(PlayerTeam.None), Timestamp = DateTime.UtcNow };
+                                        CaptureTeamRosterData(gameEndEvent);
+                                        _playByPlayEvents.Add(gameEndEvent);
+                                    }
+                                    ExportGameStats(forceExport: false);
+                                    _exportedAtGameOver = true;
+                                    string gameReferenceId = !string.IsNullOrEmpty(_currentGameReferenceId) ? _currentGameReferenceId : DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+                                    string sanitizedFileHeader = StripHtmlTags(ModServerConfig.FileHeaderName);
+                                    string fullFileName = $"{sanitizedFileHeader}_{gameReferenceId}_stats";
+                                    NetworkBehaviourSingleton<ChatManager>.Instance.Server_BroadcastChatMessage($"Game ended. Stats exported - {fullFileName}");
+                                } else {
+                                    if (ModServerConfig.EnableExportLimit) {
+                                        Logging.Log($"GameOver->FaceOff safety net: export skipped — {uniquePlayerCount} unique players (need 8+), {eventCount} events (need 300+)", ModServerConfig);
+                                    }
+                                }
                             }
-                            // Don't update period here - FaceOff happens after every goal, not just period transitions
-                            // Period is read directly from GameState when needed
-                            
-                            // Reset faceoff flag so each faceoff (including after goals) gets recorded
-                            _faceoffRecordedForCurrentPeriod = false;
-                            
-                            _lastRecordedPhase = phase;
+
+                            // Playing -> FaceOff without PreGame (legacy path). PreGame entry normally resets first.
+                            if (_lastRecordedPhase == GamePhase.Play)
+                                TryExportAbortedGameStats("Game ended early.");
+
+                            SafeSendDataToAll(RESET_ALL, "1", NetworkDelivery.ReliableSequenced);
+                            ResetAllServerStatsAndPlayByPlay();
                         }
-                        else if (phase == GamePhase.Warmup) {
-                            // Check if game ended early (transition from Playing or other phase to Warmup)
-                            // This handles early game ends due to votes (e.g., /vote endgame)
-                            // NOTE: FaceOff -> Warmup can happen on early ends (e.g., votes during stoppages),
-                            // so FaceOff should qualify as "early end". However, we exclude GameOver here to
-                            // avoid double-exporting after a normal game conclusion.
-                            if (_lastRecordedPhase != GamePhase.None && _lastRecordedPhase != GamePhase.Warmup && _lastRecordedPhase != GamePhase.GameOver) {
-                                // Game ended early - check if we should export stats
-                                if (_playByPlayEvents.Count > 0) {
-                                    // Count unique players and events
-                                    int uniquePlayerCount = 0;
-                                    int eventCount = _playByPlayEvents.Count;
-                                    
-                                    try {
-                                        var uniqueSteamIds = _playByPlayEvents
-                                            .Where(e => !string.IsNullOrEmpty(e.PlayerSteamId))
-                                            .Select(e => e.PlayerSteamId)
-                                            .Distinct()
-                                            .Count();
-                                        uniquePlayerCount = uniqueSteamIds;
-                                    }
-                                    catch (Exception ex) {
-                                        Logging.LogError($"Error counting unique players for early game end export: {ex}", ServerConfig);
-                                    }
-                                    
-                                    // Export if criteria are met (8+ players and 300+ events) or if limit is disabled
-                                    bool meetsCriteria = !ServerConfig.EnableExportLimit || (uniquePlayerCount >= 8 && eventCount >= 300);
-                                    if (meetsCriteria) {
-                                        if (!ServerConfig.EnableExportLimit) {
-                                            Logging.Log($"Early game end detected (transition to Warmup from {_lastRecordedPhase}) - exporting stats (export limit disabled)", ServerConfig);
-                                        } else {
-                                            Logging.Log($"Early game end detected (transition to Warmup from {_lastRecordedPhase}) - exporting stats", ServerConfig);
-                                        }
-                                        
-                                        // Record GameEnd event if not already present
-                                        bool hasGameEndEvent = _playByPlayEvents.Any(e => e.EventType == PlayByPlayEventType.GameEnd);
-                                        if (!hasGameEndEvent) {
-                                            int finalPeriod = GetCurrentPeriod();
-                                            float maxGameTime = _playByPlayEvents.Count > 0 ? _playByPlayEvents.Max(e => e.GameTime) : 0f;
-                                            float gameEndGameTime = maxGameTime > 0f ? maxGameTime : GetCurrentGameTime();
-                                            
-                                            var gameEndEvent = new PlayByPlayEvent {
-                                                EventId = _nextPlayByPlayEventId++,
-                                                EventType = PlayByPlayEventType.GameEnd,
-                                                GameTime = gameEndGameTime,
-                                                Period = finalPeriod,
-                                                PlayerSteamId = "",
-                                                PlayerName = "",
-                                                PlayerTeam = 0,
-                                                PlayerPosition = "",
-                                                PlayerJersey = 0,
-                                                PlayerSpeed = 0f,
-                                                Zone = EventZone.Neutral,
-                                                Position = Vector3.zero,
-                                                Velocity = Vector3.zero,
-                                                ForceMagnitude = 0f,
-                                                Outcome = "end",
-                                                Flags = "",
-                                                Team = "",
-                                                TeamInPossession = _currentTeamInPossession != PlayerTeam.None ? (_currentTeamInPossession == PlayerTeam.Blue ? "Blue" : "Red") : "",
-                                                CurrentPlayInPossession = _currentPlayInPossession.ToString(),
-                                                ScoreState = GetScoreState(PlayerTeam.None),
-                                                Timestamp = DateTime.UtcNow
-                                            };
-                                            
-                                            CaptureTeamRosterData(gameEndEvent);
-                                            
-                                            int insertIndex = _playByPlayEvents.Count;
-                                            for (int i = 0; i < _playByPlayEvents.Count; i++) {
-                                                if (_playByPlayEvents[i].GameTime >= gameEndGameTime) {
-                                                    insertIndex = i;
-                                                    break;
-                                                }
-                                            }
-                                            _playByPlayEvents.Insert(insertIndex, gameEndEvent);
-                                        }
-                                        
-                                        // Export stats (not forced - uses normal criteria check)
-                                        ExportGameStats(forceExport: false);
-                                        
-                                        // Announce in chat
-                                        if (GameManager.Instance != null && UIChat.Instance != null) {
-                                            string gameReferenceId = !string.IsNullOrEmpty(_currentGameReferenceId) ? _currentGameReferenceId : DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
-                                            string sanitizedFileHeader = StripHtmlTags(ServerConfig.FileHeaderName);
-                                            string fullFileName = $"{sanitizedFileHeader}_{gameReferenceId}_stats";
-                                            int redScore = GameManager.Instance.GameState != null ? GameManager.Instance.GameState.Value.RedScore : 0;
-                                            int blueScore = GameManager.Instance.GameState != null ? GameManager.Instance.GameState.Value.BlueScore : 0;
-                                            UIChat.Instance.Server_SendSystemChatMessage($"Game ended early. Stats exported - Final Score: Red {redScore} - Blue {blueScore} | File: {fullFileName}");
-                                        }
+                        else if (_lastRecordedPhase == GamePhase.PreGame) {
+                            // PreGame entry already wiped server stats (no broadcast). Sync clients at lobby faceoff.
+                            SafeSendDataToAll(RESET_ALL, "1", NetworkDelivery.ReliableSequenced);
+                        }
+                        // Don't update period here - FaceOff happens after every goal, not just period transitions
+                        // Period is read directly from GameState when needed
+
+                        // Reset faceoff flag so each faceoff (including after goals) gets recorded
+                        _faceoffRecordedForCurrentPeriod = false;
+
+                        _lastRecordedPhase = phase;
+                    }
+                    else if (phase == GamePhase.Warmup) {
+                        // Don't send RESET_ALL here - keep stats visible until next game begins (FaceOff).
+                        // Fallback export: fires when the GameOver block couldn't export (e.g. criteria check threw).
+                        // cameFromGameOver distinguishes a normal game end (GameOver→Warmup) from an interrupted game (FaceOff→Warmup).
+                        bool cameFromGameOver = (_lastRecordedPhase == GamePhase.GameOver);
+                        bool shouldTryEarlyExport = !_exportedAtResetGameState
+                            && _lastRecordedPhase != GamePhase.None && _lastRecordedPhase != GamePhase.Warmup
+                            && (!cameFromGameOver || !_exportedAtGameOver);
+                        if (shouldTryEarlyExport) {
+                            if (_playByPlayEvents.Count > 0) {
+                                int uniquePlayerCount = 0;
+                                int eventCount = _playByPlayEvents.Count;
+
+                                try {
+                                    var uniqueSteamIds = _playByPlayEvents
+                                        .Where(e => !string.IsNullOrEmpty(e.PlayerSteamId))
+                                        .Select(e => e.PlayerSteamId)
+                                        .Distinct()
+                                        .Count();
+                                    uniquePlayerCount = uniqueSteamIds;
+                                }
+                                catch (Exception ex) {
+                                    Logging.LogError($"Error counting unique players for early game end export: {ex}", ModServerConfig);
+                                }
+
+                                bool meetsCriteria = !ModServerConfig.EnableExportLimit || (uniquePlayerCount >= 8 && eventCount >= 300);
+                                if (meetsCriteria) {
+                                    if (!ModServerConfig.EnableExportLimit) {
+                                        Logging.Log($"Warmup fallback export (from {_lastRecordedPhase}) - exporting stats (export limit disabled)", ModServerConfig);
                                     } else {
-                                        if (ServerConfig.EnableExportLimit) {
-                                            Logging.Log($"Early game end detected (transition to Warmup from {_lastRecordedPhase}) - Export skipped: {uniquePlayerCount} unique players (need 8+), {eventCount} events (need 300+)", ServerConfig);
+                                        Logging.Log($"Warmup fallback export (from {_lastRecordedPhase}) - exporting stats", ModServerConfig);
+                                    }
+
+                                    // Record GameEnd event if not already present
+                                    bool hasGameEndEvent = _playByPlayEvents.Any(e => e.EventType == PlayByPlayEventType.GameEnd);
+                                    if (!hasGameEndEvent) {
+                                        int finalPeriod = GetCurrentPeriod();
+                                        float maxGameTime = _playByPlayEvents.Count > 0 ? _playByPlayEvents.Max(e => e.GameTime) : 0f;
+                                        float gameEndGameTime = maxGameTime > 0f ? maxGameTime : GetCurrentGameTime();
+
+                                        var gameEndEvent = new PlayByPlayEvent {
+                                            EventId = _nextPlayByPlayEventId++,
+                                            EventType = PlayByPlayEventType.GameEnd,
+                                            GameTime = gameEndGameTime,
+                                            Period = finalPeriod,
+                                            PlayerSteamId = "",
+                                            PlayerName = "",
+                                            PlayerTeam = 0,
+                                            PlayerPosition = "",
+                                            PlayerJersey = 0,
+                                            PlayerSpeed = 0f,
+                                            Zone = EventZone.Neutral,
+                                            Position = Vector3.zero,
+                                            Velocity = Vector3.zero,
+                                            ForceMagnitude = 0f,
+                                            Outcome = "end",
+                                            Flags = "",
+                                            Team = "",
+                                            TeamInPossession = _currentTeamInPossession != PlayerTeam.None ? (_currentTeamInPossession == PlayerTeam.Blue ? "Blue" : "Red") : "",
+                                            CurrentPlayInPossession = _currentPlayInPossession.ToString(),
+                                            ScoreState = GetScoreState(PlayerTeam.None),
+                                            Timestamp = DateTime.UtcNow
+                                        };
+
+                                        CaptureTeamRosterData(gameEndEvent);
+
+                                        int insertIndex = _playByPlayEvents.Count;
+                                        for (int i = 0; i < _playByPlayEvents.Count; i++) {
+                                            if (_playByPlayEvents[i].GameTime >= gameEndGameTime) {
+                                                insertIndex = i;
+                                                break;
+                                            }
                                         }
+                                        _playByPlayEvents.Insert(insertIndex, gameEndEvent);
+                                    }
+
+                                    ExportGameStats(forceExport: false);
+
+                                    // Announce unconditionally — no GameManager.Instance null-check here.
+                                    // Previously this broadcast was wrapped in `if (GameManager.Instance != null)`,
+                                    // which silently swallowed the message whenever GameManager was null at the
+                                    // GameOver → Warmup transition (files were written to disk but no chat fired).
+                                    // ChatManager is all that's needed for a broadcast; GameManager is irrelevant.
+                                    // "Game ended." = normal end that fell through from GameOver;
+                                    // "Game ended early." = interrupted game (e.g. vote-to-warmup mid-match).
+                                    string gameReferenceId = !string.IsNullOrEmpty(_currentGameReferenceId) ? _currentGameReferenceId : DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+                                    string sanitizedFileHeader = StripHtmlTags(ModServerConfig.FileHeaderName);
+                                    string fullFileName = $"{sanitizedFileHeader}_{gameReferenceId}_stats";
+                                    string endedMsg = cameFromGameOver ? "Game ended." : "Game ended early.";
+                                    NetworkBehaviourSingleton<ChatManager>.Instance.Server_BroadcastChatMessage($"{endedMsg} Stats exported - {fullFileName}");
+                                } else {
+                                    if (ModServerConfig.EnableExportLimit) {
+                                        Logging.Log($"Warmup fallback export (from {_lastRecordedPhase}) - Export skipped: {uniquePlayerCount} unique players (need 8+), {eventCount} events (need 300+)", ModServerConfig);
                                     }
                                 }
                             }
-                            
-                            _playByPlayEvents.Clear();
-                            _nextPlayByPlayEventId = 0;
-                            _lastProcessedZoneFlagEventId = -1; // Reset zone flag scanner
-                            _currentTeamInPossession = PlayerTeam.None;
-                            _currentPlayInPossession = 0;
-                            _gameStartTime = 0f; // Reset so it initializes on next game start
-                            _currentPeriod = 1;
-                            _lastTrackedPeriod = 0; // Reset period tracking
-                            _lastRecordedPhase = phase;
-                            
-                            // Reset game time tracking for fractional precision
-                            _lastWholeSecondGameTime = 0f;
-                            _lastUnityTimeForGameTime = 0f;
-                            _lastCountdownValue = -1;
-                            
-                            // Clear pending shot releases
-                            foreach (PlayerTeam team in new List<PlayerTeam>(_pendingShotReleases.Keys)) {
-                                _pendingShotReleases[team] = ("", Vector3.zero, Vector3.zero, Vector3.zero, DateTime.MinValue);
-                            }
-                            
-                            // Reset raycast state tracking
-                            foreach (PlayerTeam team in new List<PlayerTeam>(_previousRaycastState.Keys)) {
-                                _previousRaycastState[team] = false;
-                            }
-                            
-                            // Reset raycast frame counters
-                            foreach (PlayerTeam team in new List<PlayerTeam>(_raycastTrueFrames.Keys)) {
-                                _raycastTrueFrames[team] = 0;
-                            }
-                            
-                            // Reset shot recorded flags
-                            foreach (PlayerTeam team in new List<PlayerTeam>(_shotRecordedForRaycast.Keys)) {
-                                _shotRecordedForRaycast[team] = false;
-                            }
-                        }
-                        else if (phase == GamePhase.Playing) {
-                            // Ensure tracking is initialized even if we missed FaceOff
-                            if (_gameStartTime == 0f) {
-                                _gameStartTime = Time.time;
-                                if (string.IsNullOrEmpty(_currentGameReferenceId)) {
-                                    _currentGameReferenceId = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
-                                }
-                            }
-                            
-                            // Detect period transition and resolve pending faceoff
-                            int currentPeriod = GetCurrentPeriod();
-                            
-                            // Initialize _lastTrackedPeriod if it's 0 (first time in Playing phase)
-                            if (_lastTrackedPeriod == 0 && currentPeriod > 0) {
-                                _lastTrackedPeriod = currentPeriod;
-                            }
-                            
-                            if (currentPeriod > 0 && currentPeriod != _lastTrackedPeriod && _lastTrackedPeriod > 0) {
-                                // Period has changed - resolve any pending faceoff
-                                ResolvePendingFaceoffOnTrackingStop();
-                                Logging.Log($"Period transition detected: {_lastTrackedPeriod} -> {currentPeriod}. Resolved pending faceoff.", ServerConfig);
-                            }
-                            _lastTrackedPeriod = currentPeriod;
-                            
-                            // If we somehow missed recording faceoff in FaceOff phase, record it here as fallback
-                            if (!_faceoffRecordedForCurrentPeriod && (_lastRecordedPhase == GamePhase.FaceOff || _lastRecordedPhase == GamePhase.None || _lastRecordedPhase == GamePhase.Warmup)) {
-                                // Resolve any pending faceoff before starting a new one
-                                ResolvePendingFaceoffOnTrackingStop();
-                                
-                                RecordFaceoffEvent();
-                                _faceoffRecordedForCurrentPeriod = true;
-                                
-                                // Start tracking faceoff outcome
-                                _trackingFaceoffOutcome = true;
-                                _faceoffPossessionChainCount = 0;
-                                _faceoffPossessionTeam = PlayerTeam.None;
-                                _faceoffTotalIncremented = false; // Reset flag for new faceoff
-                            }
-                            
-                            _lastRecordedPhase = phase;
-                        }
-                        else {
-                            _lastRecordedPhase = phase;
                         }
 
-                        // Reset player on puck.
-                        foreach (PlayerTeam key in new List<PlayerTeam>(_lastPlayerOnPuckTipIncludedSteamId.Keys))
-                            _lastPlayerOnPuckTipIncludedSteamId[key] = ("", DateTime.MinValue);
-
-                        foreach (PlayerTeam key in new List<PlayerTeam>(_lastPlayerOnPuckSteamId.Keys))
-                            _lastPlayerOnPuckSteamId[key] = ("", DateTime.MinValue);
-
-                        // Reset shot counted states.
-                        foreach (PlayerTeam key in new List<PlayerTeam>(_lastShotWasCounted.Keys))
-                            _lastShotWasCounted[key] = true;
-
-                        // Reset block counted states.
-                        foreach (PlayerTeam key in new List<PlayerTeam>(_lastBlockWasCounted.Keys))
-                            _lastBlockWasCounted[key] = true;
-
-                        // Reset possession times.
-                        foreach (Stopwatch watch in _playersLastTimePuckPossession.Values)
-                            watch.Stop();
-                        _playersLastTimePuckPossession.Clear();
-
-                        // Reset last possession to prevent false turnovers/takeaways at period start
-                        _lastPossession = new Possession();
-                        
-                        // Reset possession chain tracking to prevent false turnovers/takeaways at period start
+                        _playByPlayEvents.Clear();
+                        _nextPlayByPlayEventId = 0;
+                        _lastProcessedZoneFlagEventId = -1; // Reset zone flag scanner
                         _currentTeamInPossession = PlayerTeam.None;
                         _currentPlayInPossession = 0;
+                        _gameStartTime = 0f; // Reset so it initializes on next game start
+                        _currentPeriod = 1;
+                        _lastTrackedPeriod = 0; // Reset period tracking
+                        _lastRecordedPhase = phase;
 
-                        // Reset puck collision stay or exit times.
-                        foreach (Stopwatch watch in _lastTimeOnCollisionStayOrExitWasCalled.Values)
-                            watch.Stop();
-                        _lastTimeOnCollisionStayOrExitWasCalled.Clear();
+                        // Reset game time tracking for fractional precision
+                        _lastWholeSecondGameTime = 0f;
+                        _lastUnityTimeForGameTime = 0f;
+                        _lastCountdownValue = -1;
 
-                        // Reset tipped times.
-                        foreach (Stopwatch watch in _playersCurrentPuckTouch.Values)
-                            watch.Stop();
-                        _playersCurrentPuckTouch.Clear();
+                        // Clear both GameOver export flags so the next game starts clean.
+                        // _gameOverBlockEntered resets so the GameOver block can run again;
+                        // _exportedAtGameOver resets so the Warmup fallback will attempt export
+                        // if (and only if) the GameOver block doesn't set it to true first.
+                        _gameOverBlockEntered = false;
+                        _exportedAtGameOver   = false;
+                        _exportedAtResetGameState = false;
 
-                        if (phase == GamePhase.GameOver) {
-                            // Record GameEnd event when game concludes
-                            // Check if we already have a GameEnd event
-                            bool hasGameEndEvent = _playByPlayEvents.Any(e => 
-                                e.EventType == PlayByPlayEventType.GameEnd);
-                            
-                            if (!hasGameEndEvent) {
-                                int finalPeriod = GetCurrentPeriod();
-                                
-                                // If game ended in regulation (3 periods), use exactly 900.0
-                                // Check both finalPeriod == 3 and if max gameTime is close to 900 (within 5 seconds)
-                                // This handles cases where period might be 4+ but game actually ended in regulation
-                                float maxGameTime = _playByPlayEvents.Count > 0 ? _playByPlayEvents.Max(e => e.GameTime) : 0f;
-                                float gameEndGameTime;
-                                if (finalPeriod == 3 || (maxGameTime >= 895f && maxGameTime <= 905f)) {
-                                    // Game ended in regulation - use exactly 900.0 seconds
-                                    gameEndGameTime = 900.0f;
+                        // Clear pending shot releases
+                        foreach (PlayerTeam team in new List<PlayerTeam>(_pendingShotReleases.Keys)) {
+                            _pendingShotReleases[team] = ("", Vector3.zero, Vector3.zero, Vector3.zero, DateTime.MinValue);
+                        }
+
+                        // Reset raycast state tracking
+                        foreach (PlayerTeam team in new List<PlayerTeam>(_previousRaycastState.Keys)) {
+                            _previousRaycastState[team] = false;
+                        }
+
+                        // Reset raycast frame counters
+                        foreach (PlayerTeam team in new List<PlayerTeam>(_raycastTrueFrames.Keys)) {
+                            _raycastTrueFrames[team] = 0;
+                        }
+
+                        // Reset shot recorded flags
+                        foreach (PlayerTeam team in new List<PlayerTeam>(_shotRecordedForRaycast.Keys)) {
+                            _shotRecordedForRaycast[team] = false;
+                        }
+                    }
+                    else if (phase == GamePhase.Play) {
+                        // Ensure tracking is initialized even if we missed FaceOff
+                        if (_gameStartTime == 0f) {
+                            _gameStartTime = Time.time;
+                            if (string.IsNullOrEmpty(_currentGameReferenceId)) {
+                                _currentGameReferenceId = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+                            }
+                        }
+
+                        // Detect period transition and resolve pending faceoff
+                        int currentPeriod = GetCurrentPeriod();
+
+                        // Initialize _lastTrackedPeriod if it's 0 (first time in Playing phase)
+                        if (_lastTrackedPeriod == 0 && currentPeriod > 0) {
+                            _lastTrackedPeriod = currentPeriod;
+                        }
+
+                        if (currentPeriod > 0 && currentPeriod != _lastTrackedPeriod && _lastTrackedPeriod > 0) {
+                            // Period has changed - resolve any pending faceoff
+                            ResolvePendingFaceoffOnTrackingStop();
+                            Logging.Log($"Period transition detected: {_lastTrackedPeriod} -> {currentPeriod}. Resolved pending faceoff.", ModServerConfig);
+                        }
+                        _lastTrackedPeriod = currentPeriod;
+
+                        // If we somehow missed recording faceoff in FaceOff phase, record it here as fallback
+                        if (!_faceoffRecordedForCurrentPeriod && (_lastRecordedPhase == GamePhase.FaceOff || _lastRecordedPhase == GamePhase.None || _lastRecordedPhase == GamePhase.Warmup)) {
+                            // Resolve any pending faceoff before starting a new one
+                            ResolvePendingFaceoffOnTrackingStop();
+
+                            RecordFaceoffEvent();
+                            _faceoffRecordedForCurrentPeriod = true;
+
+                            // Start tracking faceoff outcome
+                            _trackingFaceoffOutcome = true;
+                            _faceoffPossessionChainCount = 0;
+                            _faceoffPossessionTeam = PlayerTeam.None;
+                            _faceoffTotalIncremented = false; // Reset flag for new faceoff
+                        }
+
+                        _lastRecordedPhase = phase;
+                    }
+                    else {
+                        _lastRecordedPhase = phase;
+                    }
+
+                    // Reset player on puck.
+                    foreach (PlayerTeam key in new List<PlayerTeam>(_lastPlayerOnPuckTipIncludedSteamId.Keys))
+                        _lastPlayerOnPuckTipIncludedSteamId[key] = ("", DateTime.MinValue);
+
+                    foreach (PlayerTeam key in new List<PlayerTeam>(_lastPlayerOnPuckSteamId.Keys))
+                        _lastPlayerOnPuckSteamId[key] = ("", DateTime.MinValue);
+
+                    // Reset shot counted states.
+                    foreach (PlayerTeam key in new List<PlayerTeam>(_lastShotWasCounted.Keys))
+                        _lastShotWasCounted[key] = true;
+
+                    // Reset block counted states.
+                    foreach (PlayerTeam key in new List<PlayerTeam>(_lastBlockWasCounted.Keys))
+                        _lastBlockWasCounted[key] = true;
+
+                    // Reset goal save-perc guard — each faceoff (including after goals) starts a fresh cycle.
+                    foreach (PlayerTeam key in new List<PlayerTeam>(_savePercDuringGoalProcessed.Keys))
+                        _savePercDuringGoalProcessed[key] = false;
+
+                    // Reset possession times.
+                    foreach (Stopwatch watch in _playersLastTimePuckPossession.Values)
+                        watch.Stop();
+                    _playersLastTimePuckPossession.Clear();
+
+                    // Reset last possession to prevent false turnovers/takeaways at period start
+                    _lastPossession = new Possession();
+
+                    // Reset possession chain tracking to prevent false turnovers/takeaways at period start
+                    _currentTeamInPossession = PlayerTeam.None;
+                    _currentPlayInPossession = 0;
+
+                    // Reset puck collision stay or exit times.
+                    foreach (Stopwatch watch in _lastTimeOnCollisionStayOrExitWasCalled.Values)
+                        watch.Stop();
+                    _lastTimeOnCollisionStayOrExitWasCalled.Clear();
+
+                    // Reset tipped times.
+                    foreach (Stopwatch watch in _playersCurrentPuckTouch.Values)
+                        watch.Stop();
+                    _playersCurrentPuckTouch.Clear();
+
+                    if (phase == GamePhase.GameOver) {
+                        // _gameOverBlockEntered prevents this block from running more than once per game.
+                        // The game-state event fires on every engine tick while the GameOver/podium screen
+                        // is displayed, so without this guard the export and broadcast would repeat every tick.
+                        // We set the flag immediately (before any work below) so that even if an exception
+                        // is thrown partway through, repeated ticks are still blocked.
+                        if (_gameOverBlockEntered) {
+                            // Already handled for this game — nothing to do.
+                        } else {
+                            _gameOverBlockEntered = true;
+
+                        // Record GameEnd event when game concludes
+                        // Check if we already have a GameEnd event
+                        bool hasGameEndEvent = _playByPlayEvents.Any(e =>
+                            e.EventType == PlayByPlayEventType.GameEnd);
+
+                        if (!hasGameEndEvent) {
+                            int finalPeriod = GetCurrentPeriod();
+
+                            // If game ended in regulation (3 periods), use exactly 900.0
+                            // Check both finalPeriod == 3 and if max gameTime is close to 900 (within 5 seconds)
+                            // This handles cases where period might be 4+ but game actually ended in regulation
+                            float maxGameTime = _playByPlayEvents.Count > 0 ? _playByPlayEvents.Max(e => e.GameTime) : 0f;
+                            float gameEndGameTime;
+                            if (finalPeriod == 3 || (maxGameTime >= 895f && maxGameTime <= 905f)) {
+                                // Game ended in regulation - use exactly 900.0 seconds
+                                gameEndGameTime = 900.0f;
+                            }
+                            else {
+                                // Game went to overtime or ended early - use actual max gameTime
+                                gameEndGameTime = maxGameTime > 0f ? maxGameTime : GetCurrentGameTime();
+                            }
+
+                            var gameEndEvent = new PlayByPlayEvent {
+                                EventId = _nextPlayByPlayEventId++,
+                                EventType = PlayByPlayEventType.GameEnd,
+                                GameTime = gameEndGameTime,
+                                Period = finalPeriod,
+                                PlayerSteamId = "",
+                                PlayerName = "",
+                                PlayerTeam = 0,
+                                PlayerPosition = "",
+                                PlayerJersey = 0,
+                                PlayerSpeed = 0f,
+                                Zone = EventZone.Neutral,
+                                Position = Vector3.zero,
+                                Velocity = Vector3.zero,
+                                ForceMagnitude = 0f,
+                                Outcome = "end",
+                                Flags = "",
+                                Team = "", // Game end has no team
+                                TeamInPossession = _currentTeamInPossession != PlayerTeam.None ? (_currentTeamInPossession == PlayerTeam.Blue ? "Blue" : "Red") : "",
+                                CurrentPlayInPossession = _currentPlayInPossession.ToString(),
+                                ScoreState = GetScoreState(PlayerTeam.None),
+                                Timestamp = DateTime.UtcNow
+                            };
+
+                            // Capture roster data from current game state if available
+                            CaptureTeamRosterData(gameEndEvent);
+
+                            // Insert the game end event at the correct chronological position
+                            int insertIndex = _playByPlayEvents.Count;
+                            for (int i = 0; i < _playByPlayEvents.Count; i++) {
+                                if (_playByPlayEvents[i].GameTime >= gameEndGameTime) {
+                                    insertIndex = i;
+                                    break;
                                 }
-                                else {
-                                    // Game went to overtime or ended early - use actual max gameTime
-                                    gameEndGameTime = maxGameTime > 0f ? maxGameTime : GetCurrentGameTime();
-                                }
-                                
-                                var gameEndEvent = new PlayByPlayEvent {
-                                    EventId = _nextPlayByPlayEventId++,
-                                    EventType = PlayByPlayEventType.GameEnd,
-                                    GameTime = gameEndGameTime,
-                                    Period = finalPeriod,
-                                    PlayerSteamId = "",
-                                    PlayerName = "",
-                                    PlayerTeam = 0,
-                                    PlayerPosition = "",
-                                    PlayerJersey = 0,
-                                    PlayerSpeed = 0f,
-                                    Zone = EventZone.Neutral,
-                                    Position = Vector3.zero,
-                                    Velocity = Vector3.zero,
-                                    ForceMagnitude = 0f,
-                                    Outcome = "end",
-                                    Flags = "",
-                                    Team = "", // Game end has no team
-                                    TeamInPossession = _currentTeamInPossession != PlayerTeam.None ? (_currentTeamInPossession == PlayerTeam.Blue ? "Blue" : "Red") : "",
-                                    CurrentPlayInPossession = _currentPlayInPossession.ToString(),
-                                    ScoreState = GetScoreState(PlayerTeam.None),
-                                    Timestamp = DateTime.UtcNow
-                                };
-                                
-                                // Capture roster data from current game state if available
-                                CaptureTeamRosterData(gameEndEvent);
-                                
-                                // Insert the game end event at the correct chronological position
-                                int insertIndex = _playByPlayEvents.Count;
-                                for (int i = 0; i < _playByPlayEvents.Count; i++) {
-                                    if (_playByPlayEvents[i].GameTime >= gameEndGameTime) {
-                                        insertIndex = i;
+                            }
+                            _playByPlayEvents.Insert(insertIndex, gameEndEvent);
+                            Logging.Log($"Recorded GameEnd event at gameTime {gameEndGameTime:F3} (period {finalPeriod}).", ModServerConfig);
+                        }
+
+                        string gwgSteamId = "";
+                        PlayerTeam winningTeam = PlayerTeam.None;
+                        try {
+                            // Derive score from our own goal log — newGameState scores are already
+                            // zeroed out by the time the GameOver phase event fires.
+                            int blueScore = _goals.Count(g => g.Team == "Blue");
+                            int redScore  = _goals.Count(g => g.Team == "Red");
+
+                            if (blueScore > redScore) {
+                                winningTeam = PlayerTeam.Blue;
+                                // Find the goal where Blue first took the lead
+                                int blueGoalsScored = 0;
+                                int redGoalsScored = 0;
+                                foreach (GoalInfo goal in _goals.OrderBy(g => g.GameTime)) {
+                                    if (goal.Team == "Blue") {
+                                        blueGoalsScored++;
+                                    } else {
+                                        redGoalsScored++;
+                                    }
+
+                                    if (goal.Team == "Blue" && blueGoalsScored > redGoalsScored && blueGoalsScored == redScore + 1) {
+                                        gwgSteamId = goal.Scorer;
                                         break;
                                     }
                                 }
-                                _playByPlayEvents.Insert(insertIndex, gameEndEvent);
-                                Logging.Log($"Recorded GameEnd event at gameTime {gameEndGameTime:F3} (period {finalPeriod}).", ServerConfig);
                             }
-                            
-                            string gwgSteamId = "";
-                            PlayerTeam winningTeam = PlayerTeam.None;
-                            try {
-                                int blueScore = __instance.GameState.Value.BlueScore;
-                                int redScore = __instance.GameState.Value.RedScore;
-                                
-                                if (blueScore > redScore) {
-                                    winningTeam = PlayerTeam.Blue;
-                                    // Find the goal where Blue first took the lead
-                                    int blueGoalsScored = 0;
-                                    int redGoalsScored = 0;
-                                    foreach (GoalInfo goal in _goals.OrderBy(g => g.GameTime)) {
-                                        if (goal.Team == "Blue") {
-                                            blueGoalsScored++;
-                                        } else {
-                                            redGoalsScored++;
-                                        }
-                                        
-                                        if (goal.Team == "Blue" && blueGoalsScored > redGoalsScored && blueGoalsScored == redScore + 1) {
-                                            gwgSteamId = goal.Scorer;
-                                            break;
-                                        }
-                                    }
-                                }
-                                else if (redScore > blueScore) {
-                                    winningTeam = PlayerTeam.Red;
-                                    // Find the goal where Red first took the lead
-                                    int blueGoalsScored = 0;
-                                    int redGoalsScored = 0;
-                                    foreach (GoalInfo goal in _goals.OrderBy(g => g.GameTime)) {
-                                        if (goal.Team == "Blue") {
-                                            blueGoalsScored++;
-                                        } else {
-                                            redGoalsScored++;
-                                        }
-                                        
-                                        if (goal.Team == "Red" && redGoalsScored > blueGoalsScored && redGoalsScored == blueScore + 1) {
-                                            gwgSteamId = goal.Scorer;
-                                            break;
-                                        }
-                                    }
-                                }
-
-                                LogGWG(gwgSteamId);
-                            }
-                            catch { } // Shootout goal or something, so no GWG.
-
-                            Dictionary<string, double> starPoints = new Dictionary<string, double>();
-                            foreach (Player player in PlayerManager.Instance.GetPlayers()) {
-                                if (player == null || !player)
-                                    continue;
-
-                                string steamId = player.SteamId.Value.ToString();
-                                starPoints.Add(steamId, 0);
-
-                                double gwgModifier = gwgSteamId == player.SteamId.Value.ToString() ? 0.5d : 0;
-                                double teamModifier = winningTeam == player.Team.Value ? 1.1d : 1d;
-
-                                if (PlayerFunc.IsGoalie(player)) {
-                                    // Simplified goalie point system
-                                    const double GOAL_ALLOWED_PENALTY = -10d;
-                                    const double SHOT_FACED_POINTS = 10d;
-                                    const double GOALIE_GOAL_MODIFIER = 175d;
-                                    const double GOALIE_ASSIST_MODIFIER = 30d;
-                                    const double SHUTOUT_BONUS = 100d;
-
-                                    if (_savePerc.TryGetValue(steamId, out var saveValues)) {
-                                        // Goals allowed: -10 points each
-                                        int goalsAllowed = saveValues.Shots - saveValues.Saves;
-                                        starPoints[steamId] += ((double)goalsAllowed) * GOAL_ALLOWED_PENALTY;
-                                        
-                                        // Shots faced: 10 points each
-                                        starPoints[steamId] += ((double)saveValues.Shots) * SHOT_FACED_POINTS;
-                                        
-                                        // Shutout bonus: 100 points if goalie allowed 0 goals and faced at least 1 shot
-                                        if (goalsAllowed == 0 && saveValues.Shots > 0) {
-                                            starPoints[steamId] += SHUTOUT_BONUS;
-                                        }
+                            else if (redScore > blueScore) {
+                                winningTeam = PlayerTeam.Red;
+                                // Find the goal where Red first took the lead
+                                int blueGoalsScored = 0;
+                                int redGoalsScored = 0;
+                                foreach (GoalInfo goal in _goals.OrderBy(g => g.GameTime)) {
+                                    if (goal.Team == "Blue") {
+                                        blueGoalsScored++;
+                                    } else {
+                                        redGoalsScored++;
                                     }
 
-                                    if (_passes.TryGetValue(steamId, out int passes))
-                                        starPoints[steamId] += ((double)passes) * 2.5d;
-
-                                    starPoints[steamId] += GOALIE_GOAL_MODIFIER * gwgModifier;
-                                    starPoints[steamId] += ((double)player.Goals.Value) * GOALIE_GOAL_MODIFIER;
-                                    starPoints[steamId] += ((double)player.Assists.Value) * GOALIE_ASSIST_MODIFIER;
-                                }
-                                else {
-                                    if (_sog.TryGetValue(steamId, out int shots)) {
-                                        starPoints[steamId] += ((double)shots) * 7.5d;
+                                    if (goal.Team == "Red" && redGoalsScored > blueGoalsScored && redGoalsScored == blueScore + 1) {
+                                        gwgSteamId = goal.Scorer;
+                                        break;
                                     }
-
-                                    if (_passes.TryGetValue(steamId, out int passes))
-                                        starPoints[steamId] += ((double)passes) * 2.5d;
-
-                                    if (_blocks.TryGetValue(steamId, out int blocks))
-                                        starPoints[steamId] += ((double)blocks) * 5d;
-
-                                    const double SKATER_GOAL_MODIFIER = 70d;
-                                    const double SKATER_ASSIST_MODIFIER = 30d;
-
-                                    starPoints[steamId] += SKATER_GOAL_MODIFIER * gwgModifier;
-                                    starPoints[steamId] += ((double)player.Goals.Value) * SKATER_GOAL_MODIFIER;
-                                    starPoints[steamId] += ((double)player.Assists.Value) * SKATER_ASSIST_MODIFIER;
-                                }
-
-                                // Updated skater stat multipliers
-                                if (_hits.TryGetValue(steamId, out int hits))
-                                    starPoints[steamId] += ((double)hits) * 2.5d;
-
-                                if (_takeaways.TryGetValue(steamId, out int takeaways))
-                                    starPoints[steamId] += ((double)takeaways) * 5d;
-
-                                if (_turnovers.TryGetValue(steamId, out int turnovers))
-                                    starPoints[steamId] -= ((double)turnovers) * 5d;
-
-                                // DZ Exits and OZ Entries: 1 point each
-                                if (_exits.TryGetValue(steamId, out int exits))
-                                    starPoints[steamId] += ((double)exits) * 1d;
-
-                                if (_entries.TryGetValue(steamId, out int entries))
-                                    starPoints[steamId] += ((double)entries) * 1d;
-
-                                starPoints[steamId] *= teamModifier;
-                            }
-
-                            starPoints = starPoints.OrderByDescending(x => x.Value).ToDictionary(x => x.Key, x => x.Value);
-
-                            if (starPoints.Count >= 1)
-                                _stars[1] = starPoints.ElementAt(0).Key;
-                            else
-                                _stars[1] = "";
-
-                            if (starPoints.Count >= 2)
-                                _stars[2] = starPoints.ElementAt(1).Key;
-                            else
-                                _stars[2] = "";
-
-                            if (starPoints.Count >= 3)
-                                _stars[3] = starPoints.ElementAt(2).Key;
-                            else
-                                _stars[3] = "";
-
-                            UIChat.Instance.Server_SendSystemChatMessage("STARS OF THE MATCH");
-                            foreach (KeyValuePair<int, string> star in _stars.OrderByDescending(x => x.Key)) {
-                                if (!string.IsNullOrEmpty(star.Value)) {
-                                    Player player = PlayerManager.Instance.GetPlayerBySteamId(star.Value);
-                                    if (player != null && player)
-                                        UIChat.Instance.Server_SendSystemChatMessage($"The {(star.Key == 1 ? "first" : (star.Key == 2 ? "second" : "third"))} star is... #{player.Number.Value} {player.Username.Value} !");
-
-                                    SafeSendDataToAll(STAR, $"{star.Value};{star.Key}");
-                                    LogStar(star.Value, star.Key);
                                 }
                             }
 
-                            // Check play-by-play data before creating JSON - only export if game has sufficient players and events
-                            // Count unique SteamIDs from play-by-play events
-                            int uniquePlayerCount = 0;
-                            int eventCount = _playByPlayEvents.Count;
-                            
-                            try {
-                                var uniqueSteamIds = _playByPlayEvents
-                                    .Where(e => !string.IsNullOrEmpty(e.PlayerSteamId))
-                                    .Select(e => e.PlayerSteamId)
-                                    .Distinct()
-                                    .Count();
-                                uniquePlayerCount = uniqueSteamIds;
-                            }
-                            catch (Exception ex) {
-                                Logging.LogError($"Error counting unique players for export: {ex}", ServerConfig);
-                            }
-                            
-                            // Only create and export JSON and CSV if pbp check passes (8+ players and 300+ events) or if limit is disabled
-                            bool meetsCriteria = !ServerConfig.EnableExportLimit || (uniquePlayerCount >= 8 && eventCount >= 300);
-                            if (meetsCriteria) {
-                                // Use shared export function (exports both JSON and CSV)
-                                ExportGameStats();
-                                
-                                // Announce game end with full filename and final score in chat
-                                string gameReferenceId = !string.IsNullOrEmpty(_currentGameReferenceId) ? _currentGameReferenceId : DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
-                                string sanitizedFileHeader = StripHtmlTags(ServerConfig.FileHeaderName);
-                                string fullFileName = $"{sanitizedFileHeader}_{gameReferenceId}_stats";
-                                int redScore = __instance.GameState.Value.RedScore;
-                                int blueScore = __instance.GameState.Value.BlueScore;
-                                if (UIChat.Instance != null) {
-                                    UIChat.Instance.Server_SendSystemChatMessage($"Game ended. Stats exported - Final Score: Red {redScore} - Blue {blueScore} | File: {fullFileName}");
+                            LogGWG(gwgSteamId);
+                        }
+                        catch { } // Shootout goal or something, so no GWG.
+
+                        Dictionary<string, double> starPoints = new Dictionary<string, double>();
+                        foreach (Player player in PlayerManager.Instance.GetPlayers()) {
+                            if (player == null || !player)
+                                continue;
+
+                            string steamId = player.SteamId.Value.Value;
+                            starPoints.Add(steamId, 0);
+
+                            double gwgModifier = gwgSteamId == player.SteamId.Value.Value ? 0.5d : 0;
+                            double teamModifier = winningTeam == player.Team ? 1.1d : 1d;
+
+                            if (PlayerFunc.IsGoalie(player)) {
+                                // Simplified goalie point system
+                                const double GOAL_ALLOWED_PENALTY = -10d;
+                                const double SHOT_FACED_POINTS = 10d;
+                                const double GOALIE_GOAL_MODIFIER = 175d;
+                                const double GOALIE_ASSIST_MODIFIER = 30d;
+                                const double SHUTOUT_BONUS = 100d;
+
+                                if (_savePerc.TryGetValue(steamId, out var saveValues)) {
+                                    // Goals allowed: -10 points each
+                                    int goalsAllowed = saveValues.Shots - saveValues.Saves;
+                                    starPoints[steamId] += ((double)goalsAllowed) * GOAL_ALLOWED_PENALTY;
+
+                                    // Shots faced: 10 points each
+                                    starPoints[steamId] += ((double)saveValues.Shots) * SHOT_FACED_POINTS;
+
+                                    // Shutout bonus: 100 points if goalie allowed 0 goals and faced at least 1 shot
+                                    if (goalsAllowed == 0 && saveValues.Shots > 0) {
+                                        starPoints[steamId] += SHUTOUT_BONUS;
+                                    }
                                 }
+
+                                if (_passes.TryGetValue(steamId, out int passes))
+                                    starPoints[steamId] += ((double)passes) * 2.5d;
+
+                                starPoints[steamId] += GOALIE_GOAL_MODIFIER * gwgModifier;
+                                starPoints[steamId] += ((double)player.Goals.Value) * GOALIE_GOAL_MODIFIER;
+                                starPoints[steamId] += ((double)player.Assists.Value) * GOALIE_ASSIST_MODIFIER;
                             }
                             else {
-                                if (ServerConfig.EnableExportLimit) {
-                                    Logging.Log($"Export skipped (JSON and CSV): {uniquePlayerCount} unique players (need 8+), {eventCount} events (need 300+)", ServerConfig);
+                                if (_sog.TryGetValue(steamId, out int shots)) {
+                                    starPoints[steamId] += ((double)shots) * 7.5d;
                                 }
+
+                                if (_passes.TryGetValue(steamId, out int passes))
+                                    starPoints[steamId] += ((double)passes) * 2.5d;
+
+                                if (_blocks.TryGetValue(steamId, out int blocks))
+                                    starPoints[steamId] += ((double)blocks) * 5d;
+
+                                const double SKATER_GOAL_MODIFIER = 70d;
+                                const double SKATER_ASSIST_MODIFIER = 30d;
+
+                                starPoints[steamId] += SKATER_GOAL_MODIFIER * gwgModifier;
+                                starPoints[steamId] += ((double)player.Goals.Value) * SKATER_GOAL_MODIFIER;
+                                starPoints[steamId] += ((double)player.Assists.Value) * SKATER_ASSIST_MODIFIER;
+                            }
+
+                            // Updated skater stat multipliers
+                            if (_hits.TryGetValue(steamId, out int hits))
+                                starPoints[steamId] += ((double)hits) * 2.5d;
+
+                            if (_takeaways.TryGetValue(steamId, out int takeaways))
+                                starPoints[steamId] += ((double)takeaways) * 5d;
+
+                            if (_turnovers.TryGetValue(steamId, out int turnovers))
+                                starPoints[steamId] -= ((double)turnovers) * 5d;
+
+                            // DZ Exits and OZ Entries: 1 point each
+                            if (_exits.TryGetValue(steamId, out int exits))
+                                starPoints[steamId] += ((double)exits) * 1d;
+
+                            if (_entries.TryGetValue(steamId, out int entries))
+                                starPoints[steamId] += ((double)entries) * 1d;
+
+                            starPoints[steamId] *= teamModifier;
+                        }
+
+                        starPoints = starPoints.OrderByDescending(x => x.Value).ToDictionary(x => x.Key, x => x.Value);
+
+                        if (starPoints.Count >= 1)
+                            _stars[1] = starPoints.ElementAt(0).Key;
+                        else
+                            _stars[1] = "";
+
+                        if (starPoints.Count >= 2)
+                            _stars[2] = starPoints.ElementAt(1).Key;
+                        else
+                            _stars[2] = "";
+
+                        if (starPoints.Count >= 3)
+                            _stars[3] = starPoints.ElementAt(2).Key;
+                        else
+                            _stars[3] = "";
+
+                        // Build a single stars line: "🥇 Name1, 🥈 Name2, 🥉 Name3"
+                        var starParts = new List<string>();
+                        foreach (KeyValuePair<int, string> star in _stars.OrderBy(x => x.Key)) {
+                            if (!string.IsNullOrEmpty(star.Value)) {
+                                Player player = PlayerManager.Instance.GetPlayerBySteamId(star.Value);
+                                if (player != null && player) {
+                                    starParts.Add($"{GetStarMedalGlyph(star.Key)} {player.Username.Value}");
+                                }
+                                SafeSendDataToAll(STAR, $"{star.Value};{star.Key}");
+                                LogStar(star.Value, star.Key);
                             }
                         }
+                        if (starParts.Count > 0)
+                            NetworkBehaviourSingleton<ChatManager>.Instance.Server_BroadcastChatMessage(string.Join(", ", starParts));
+
+                        // Mark phase immediately so repeated GameOver ticks are ignored even if the export block throws.
+                        _lastRecordedPhase = phase;
+
+                        // Check play-by-play data before creating JSON - only export if game has sufficient players and events.
+                        // Use a snapshot list to avoid InvalidOperationException if the collection is modified concurrently.
+                        int uniquePlayerCount = 0;
+                        List<PlayByPlayEvent> pbpSnapshot = null;
+                        try { pbpSnapshot = _playByPlayEvents.ToList(); } catch { pbpSnapshot = new List<PlayByPlayEvent>(_playByPlayEvents); }
+                        int eventCount = pbpSnapshot.Count;
+
+                        try {
+                            uniquePlayerCount = pbpSnapshot
+                                .Where(e => !string.IsNullOrEmpty(e.PlayerSteamId))
+                                .Select(e => e.PlayerSteamId)
+                                .Distinct()
+                                .Count();
+                        }
+                        catch (Exception ex) {
+                            Logging.LogError($"Error counting unique players for export: {ex}", ModServerConfig);
+                        }
+
+                        // Only create and export JSON and CSV if pbp check passes (8+ players and 300+ events) or if limit is disabled
+                        bool meetsCriteria = !ModServerConfig.EnableExportLimit || (uniquePlayerCount >= 8 && eventCount >= 300);
+#if DEBUG_MODE
+                        DebugTrace.Write("GAME_STATE", $"GameOver export criteria: uniquePlayers={uniquePlayerCount} events={eventCount} meetsCriteria={meetsCriteria} EnableExportLimit={ModServerConfig.EnableExportLimit}");
+                        DebugTrace.Flush();
+#endif
+                        if (meetsCriteria) {
+                            ExportGameStats();
+
+                            // Set _exportedAtGameOver only after the export actually ran.
+                            // The Warmup fallback path checks this flag — if true it skips its own
+                            // export so we don't write duplicate files. If the export threw above,
+                            // this line is never reached, _exportedAtGameOver stays false, and
+                            // Warmup will still attempt a recovery export.
+                            _exportedAtGameOver = true;
+
+                            string gameReferenceId = !string.IsNullOrEmpty(_currentGameReferenceId) ? _currentGameReferenceId : DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+                            string sanitizedFileHeader = StripHtmlTags(ModServerConfig.FileHeaderName);
+                            string fullFileName = $"{sanitizedFileHeader}_{gameReferenceId}_stats";
+                            NetworkBehaviourSingleton<ChatManager>.Instance.Server_BroadcastChatMessage($"Game ended. Stats exported - {fullFileName}");
+                        }
+                        else {
+                            if (ModServerConfig.EnableExportLimit) {
+                                Logging.Log($"Export skipped (JSON and CSV): {uniquePlayerCount} unique players (need 8+), {eventCount} events (need 300+)", ModServerConfig);
+                            }
+                        }
+
+                        } // end else (_gameOverBlockEntered guard)
                     }
                 }
-                catch (Exception ex) {
-                    Logging.LogError($"Error in GameManager_Server_SetPhase_Patch Prefix().\n{ex}", ServerConfig);
-                }
+            }
+            catch (Exception ex) {
+                Logging.LogError($"Error in Event_Everyone_OnGameStateChanged.\n{ex}", ModServerConfig);
+            }
+        }
+        /// <summary>
+        /// Class that patches WrapPlayerUsername event from UIChat.
+        /// </summary>
+        // WrapPlayerUsername may have been renamed in B323; using string literal ? verify at runtime
+        [HarmonyPatch(typeof(UIChat), "GetChatMessagePrefix")]
+        public static class UIChat_GetChatMessagePrefix_Patch {
+            public static void Postfix(ChatMessage chatMessage, ref string __result) {
+                if (!chatMessage.SteamID.HasValue)
+                    return;
 
-                return true;
+                string steamId = chatMessage.SteamID.Value.Value;
+                if (string.IsNullOrEmpty(steamId) || !_stars.Values.Contains(steamId))
+                    return;
+
+                __result = GetStarTagForChat(steamId) + __result;
             }
         }
 
         /// <summary>
-        /// Class that patches WrapPlayerUsername event from UIChat.
+        /// Patches Application.OpenURL so that Workshop/steamcommunity URLs open in the Steam overlay browser instead of the system browser.
         /// </summary>
-        [HarmonyPatch(typeof(UIChat), nameof(UIChat.WrapPlayerUsername))]
-        public static class UIChat_WrapPlayerUsername_Patch {
-            public static void Postfix(Player player, ref string __result) {
-                if (player == null || !player)
-                    return;
+        [HarmonyPatch(typeof(Application), nameof(Application.OpenURL))]
+        public static class Application_OpenURL_Patch {
+            public static bool Prefix(string url) {
+                if (string.IsNullOrEmpty(url) || !url.Contains("steamcommunity.com"))
+                    return true;
 
-                string steamId = player.SteamId.Value.ToString();
-                if (string.IsNullOrEmpty(steamId))
-                    return;
+                try {
+                    foreach (Assembly asm in AppDomain.CurrentDomain.GetAssemblies()) {
+                        Type steamFriends = asm.GetType("Steamworks.SteamFriends");
+                        if (steamFriends == null)
+                            continue;
 
-                 __result = GetStarTag(steamId) + __result;
+                        MethodInfo method = steamFriends.GetMethod("ActivateGameOverlayToWebPage", BindingFlags.Public | BindingFlags.Static, null, new Type[] { typeof(string) }, null);
+                        if (method != null) {
+                            method.Invoke(null, new object[] { url });
+                            return false;
+                        }
+
+                        method = steamFriends.GetMethod("OpenWebOverlay", BindingFlags.Public | BindingFlags.Static, null, new Type[] { typeof(string), typeof(bool) }, null);
+                        if (method != null) {
+                            method.Invoke(null, new object[] { url, false });
+                            return false;
+                        }
+                    }
+                }
+                catch { }
+
+                return true;
             }
         }
 
@@ -2789,95 +3136,231 @@ namespace oomtm450PuckMod_Stats {
                 if (_harmonyPatched)
                     return true;
 
-                Logging.Log($"Enabling...", ServerConfig, true);
+                bool isServer = ServerFunc.IsDedicatedServer();
+#if DEBUG_MODE
+                DebugTrace.Init(isServer);
+                DebugTrace.Section("LIFECYCLE");
+                DebugTrace.Write("LIFECYCLE", $"OnEnable called. IsDedicatedServer={isServer} Version={MOD_VERSION}");
+#endif
+#if PUCK_API_DUMP
+                if (isServer)
+                    DumpGameAPI();
+#endif
+                Logging.Log($"Enabling...", ModServerConfig, true);
 
-                _harmony.PatchAll();
+                // ── Pre-patch reflection validation ──────────────────────────────────
+                // Verify every patched method/property exists BEFORE Harmony touches it.
+                // This produces a clear "method not found" message instead of a cryptic Harmony error.
+                var missingTargets = new List<string>();
+                void CheckMethod(Type t, string methodName) {
+                    if (t == null) { missingTargets.Add($"(null type).{methodName}()"); return; }
+                    var flags = BindingFlags.Instance | BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic;
+                    if (t.GetMethod(methodName, flags) == null)
+                        missingTargets.Add($"{t.FullName}.{methodName}()");
+                }
+                void CheckProp(Type t, string propName) {
+                    if (t == null) { missingTargets.Add($"(null type).{propName}"); return; }
+                    var flags = BindingFlags.Instance | BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic;
+                    if (t.GetProperty(propName, flags) == null)
+                        missingTargets.Add($"{t.FullName}.{propName} (property)");
+                }
+                // Puck collision callbacks
+                CheckMethod(typeof(Puck), "OnCollisionEnter");
+                CheckMethod(typeof(Puck), "OnCollisionStay");
+                CheckMethod(typeof(Puck), "OnCollisionExit");
+                // Properties used at runtime inside those patches
+                CheckProp(typeof(Puck), "IsTouchingStick");
+                // PlayerBody collision
+                CheckMethod(typeof(PlayerBody), "OnCollisionEnter");
 
-                Logging.Log($"Enabled.", ServerConfig, true);
+                if (missingTargets.Count > 0) {
+                    string missingReport = string.Join("\n", missingTargets.Select(m => "  MISSING: " + m));
+                    Logging.LogError($"Pre-patch validation failed — {missingTargets.Count} target(s) not found in current game build:\n{missingReport}", ModServerConfig);
+#if DEBUG_MODE
+                    DebugTrace.Section("HARMONY");
+                    foreach (var m in missingTargets)
+                        DebugTrace.Write("HARMONY", $"PRE-PATCH MISSING: {m}");
+                    DebugTrace.Flush();
+#endif
+                }
+                else {
+                    Logging.Log("Pre-patch validation OK — all target methods/properties found.", ModServerConfig, true);
+#if DEBUG_MODE
+                    DebugTrace.Section("HARMONY");
+                    DebugTrace.Write("HARMONY", "Pre-patch validation OK");
+#endif
+                }
 
+                // ── Harmony patching ────────────────────────────────────────────────
+                _harmonyPatchTargets.Clear();
+                var patchErrors = new List<string>();
+                var patchSuccess = new List<string>();
+                foreach (var type in Assembly.GetExecutingAssembly().GetTypes()) {
+                    try {
+                        var patchMethods = _harmony.CreateClassProcessor(type).Patch();
+                        if (patchMethods != null && patchMethods.Count > 0) {
+                            patchSuccess.Add(type.Name);
+                            _harmonyPatchTargets.AddRange(patchMethods);
+                        }
+                    }
+                    catch (Exception patchEx) {
+                        string inner = patchEx.InnerException != null ? $" → {patchEx.InnerException.Message}" : "";
+                        patchErrors.Add($"  {type.Name}: {patchEx.Message}{inner}");
+                    }
+                }
+
+                string patchSummary = $"Harmony: {patchSuccess.Count} OK, {patchErrors.Count} FAILED";
+                Logging.Log(patchSummary, ModServerConfig, true);
+                foreach (var ok in patchSuccess)
+                    Logging.Log($"  PATCHED: {ok}", ModServerConfig, true);
+                if (patchErrors.Count > 0)
+                    Logging.LogError($"Harmony patch failures ({patchErrors.Count}):\n{string.Join("\n", patchErrors)}", ModServerConfig);
+
+#if DEBUG_MODE
+                DebugTrace.Write("HARMONY", patchSummary);
+                foreach (var ok in patchSuccess)
+                    DebugTrace.Write("HARMONY", $"  OK: {ok}");
+                foreach (var err in patchErrors)
+                    DebugTrace.Write("HARMONY", $"  FAIL: {err}");
+                DebugTrace.Flush();
+#endif
+                // Don't hard-fail on patch errors — log them and continue so partial functionality works.
+                // Critical patches (collision/saves) failing will surface naturally through missing stats.
+
+                Logging.Log($"Enabled.", ModServerConfig, true);
+
+                Logging.Log("Stats mod loaded", _clientConfig);
+
+#if DEBUG_MODE
+                DebugTrace.Write("LIFECYCLE", "Registering network handlers...");
+#endif
                 NetworkCommunication.AddToNotLogList(DATA_NAMES_TO_IGNORE);
 
                 if (ServerFunc.IsDedicatedServer()) {
+#if DEBUG_MODE
+                    DebugTrace.Write("LIFECYCLE", "Server path: registering named message handlers...");
+#endif
                     Server_RegisterNamedMessageHandler();
 
-                    Logging.Log("Setting server sided config.", ServerConfig, true);
-                    ServerConfig = ServerConfig.ReadConfig();
+                    Logging.Log("Setting server sided config.", ModServerConfig, true);
+#if DEBUG_MODE
+                    DebugTrace.Write("LIFECYCLE", "Reading server config...");
+#endif
+                    ModServerConfig = ModServerConfig.ReadConfig();
                     
-                    // Always use server name (part before | if present) and remove spaces
+                    // Derive FileHeaderName from the server name, unless admin has opted into a custom name.
+                    // Format: "[Bracket Tag] | League Name | City"  →  second pipe-segment used (e.g. "PHL_Official_#")
                     try {
-                        if (ServerManager.Instance != null && 
-                            ServerManager.Instance.ServerConfigurationManager != null && 
-                            ServerManager.Instance.ServerConfigurationManager.ServerConfiguration != null) {
-                            string serverName = ServerManager.Instance.ServerConfigurationManager.ServerConfiguration.name;
+                        if (ServerManager.Instance != null && !ModServerConfig.UseCustomFileHeaderName) {
+                            string serverName = ServerManager.Instance.Server.Value.Name.Value;
                             if (!string.IsNullOrEmpty(serverName)) {
-                                // Get only the part before | if it exists
-                                int pipeIndex = serverName.IndexOf('|');
-                                if (pipeIndex >= 0) {
-                                    serverName = serverName.Substring(0, pipeIndex).Trim();
+                                string[] segments = serverName.Split('|');
+                                if (segments.Length >= 2) {
+                                    // Use the second segment (index 1) — the league/event name portion
+                                    serverName = segments[1].Trim();
                                 }
-                                // Remove all spaces
-                                serverName = serverName.Replace(" ", "");
-                                // Sanitize for filename use - remove HTML/rich text tags (anything between < and >)
+                                else {
+                                    serverName = serverName.Trim();
+                                }
+                                // Sanitize for filename use
                                 serverName = StripHtmlTags(serverName);
-                                
-                                // Remove parentheses
+                                serverName = serverName.Replace("[", "").Replace("]", "");
                                 serverName = serverName.Replace("(", "").Replace(")", "");
-                                
-                                // Remove invalid filename characters
+                                serverName = serverName.Replace(" ", "_");
                                 char[] invalidChars = Path.GetInvalidFileNameChars();
                                 foreach (char c in invalidChars) {
                                     serverName = serverName.Replace(c.ToString(), "");
                                 }
-                                serverName = serverName.Trim();
-                                // If after sanitization it's empty, use default
+                                while (serverName.Contains("__"))
+                                    serverName = serverName.Replace("__", "_");
+                                serverName = serverName.Trim('_');
                                 if (string.IsNullOrEmpty(serverName)) {
                                     serverName = "puck";
                                 }
-                                ServerConfig.FileHeaderName = serverName;
-                                Logging.Log($"FileHeaderName set from server name: {ServerConfig.FileHeaderName}", ServerConfig, true);
+                                ModServerConfig.FileHeaderName = serverName;
+                                Logging.Log($"FileHeaderName set from server name: {ModServerConfig.FileHeaderName}", ModServerConfig, true);
                                 
                                 // Write updated config back to file
                                 try {
                                     string rootPath = Path.GetFullPath(".");
                                     string configPath = Path.Combine(rootPath, Constants.MOD_NAME + "_serverconfig.json");
-                                    File.WriteAllText(configPath, ServerConfig.ToString());
-                                    Logging.Log($"Updated server config file with FileHeaderName: {ServerConfig.FileHeaderName}", ServerConfig, true);
+                                    File.WriteAllText(configPath, ModServerConfig.ToString());
+                                    Logging.Log($"Updated server config file with FileHeaderName: {ModServerConfig.FileHeaderName}", ModServerConfig, true);
                                 }
                                 catch (Exception writeEx) {
-                                    Logging.LogError($"Can't write the server config file after updating FileHeaderName. (Permission error ?)\n{writeEx}", ServerConfig);
+                                    Logging.LogError($"Can't write the server config file after updating FileHeaderName. (Permission error ?)\n{writeEx}", ModServerConfig);
                                 }
                             }
                         }
                     }
                     catch (Exception ex) {
-                        Logging.LogError($"Error setting FileHeaderName from server name: {ex}", ServerConfig);
+                        Logging.LogError($"Error setting FileHeaderName from server name: {ex}", ModServerConfig);
                     }
                 }
                 else {
-                    Logging.Log("Setting client sided config.", ServerConfig, true);
+                    Logging.Log("Setting client sided config.", ModServerConfig, true);
+#if DEBUG_MODE
+                    DebugTrace.Write("LIFECYCLE", "Client path: reading client config...");
+#endif
                     _clientConfig = ClientConfig.ReadConfig();
+#if DEBUG_MODE
+                    DebugTrace.Write("LIFECYCLE", "Client config loaded.");
+#endif
                 }
 
-                Logging.Log("Subscribing to events.", ServerConfig, true);
+                Logging.Log("Subscribing to events.", ModServerConfig, true);
+#if DEBUG_MODE
+                DebugTrace.Write("LIFECYCLE", "Subscribing to EventManager events...");
+#endif
 
                 if (ServerFunc.IsDedicatedServer()) {
-                    EventManager.Instance.AddEventListener("Event_OnClientConnected", Event_OnClientConnected);
-                    EventManager.Instance.AddEventListener("Event_OnClientDisconnected", Event_OnClientDisconnected);
-                    EventManager.Instance.AddEventListener("Event_OnPlayerRoleChanged", Event_OnPlayerRoleChanged);
-                    EventManager.Instance.AddEventListener(Codebase.Constants.STATS_MOD_NAME, Event_OnStatsTrigger);
-                    EventManager.Instance.AddEventListener(Codebase.Constants.RULESET_MOD_NAME, Event_OnRulesetTrigger);
+                    SubscribeEvent("Event_Everyone_OnClientConnected",       Event_OnClientConnected);
+                    SubscribeEvent("Event_Everyone_OnClientDisconnected",    Event_OnClientDisconnected);
+                    SubscribeEvent("Event_Everyone_OnPlayerGameStateChanged",Event_OnPlayerRoleChanged);
+                    SubscribeEvent("Event_Everyone_OnGameStateChanged",      Event_Everyone_OnGameStateChanged);
+                    SubscribeEvent(Codebase.Constants.STATS_MOD_NAME,       Event_OnStatsTrigger);
+                    SubscribeEvent(Codebase.Constants.RULESET_MOD_NAME,     Event_OnRulesetTrigger);
                 }
                 else {
-                    EventManager.Instance.AddEventListener("Event_Client_OnClientStopped", Event_Client_OnClientStopped);
+                    SubscribeEvent("Event_OnClientStopped", Event_Client_OnClientStopped);
                 }
 
                 _harmonyPatched = true;
                 _logic = true;
+#if DEBUG_MODE
+                DebugTrace.Write("LIFECYCLE", $"OnEnable complete. IsDedicatedServer={isServer} Version={MOD_VERSION}");
+                DebugTrace.Flush();
+#endif
                 return true;
             }
             catch (Exception ex) {
-                Logging.LogError($"Failed to enable.\n{ex}", ServerConfig);
+                Logging.LogError($"Failed to enable.\n{ex}", ModServerConfig);
+#if DEBUG_MODE
+                DebugTrace.Write("LIFECYCLE", $"OnEnable EXCEPTION: {ex}");
+                DebugTrace.Flush();
+#endif
                 return false;
+            }
+        }
+
+        /// <summary>
+        /// Wraps EventManager.AddEventListener with trace logging so any broken/renamed
+        /// event names surface immediately in the debug log instead of silently doing nothing.
+        /// </summary>
+        private static void SubscribeEvent(string eventName, Action<Dictionary<string, object>> handler) {
+            try {
+                EventManager.AddEventListener(eventName, handler);
+                Logging.Log($"  Subscribed: {eventName}", ModServerConfig, true);
+#if DEBUG_MODE
+                DebugTrace.Write("LIFECYCLE", $"  Event OK: {eventName}");
+#endif
+            }
+            catch (Exception ex) {
+                Logging.LogError($"  Failed to subscribe to event '{eventName}': {ex.Message}", ModServerConfig);
+#if DEBUG_MODE
+                DebugTrace.Write("LIFECYCLE", $"  Event FAIL: {eventName} — {ex.Message}");
+                DebugTrace.Flush();
+#endif
             }
         }
 
@@ -2890,20 +3373,21 @@ namespace oomtm450PuckMod_Stats {
                 if (!_harmonyPatched)
                     return true;
 
-                Logging.Log($"Disabling...", ServerConfig, true);
+                Logging.Log($"Disabling...", ModServerConfig, true);
 
-                Logging.Log("Unsubscribing from events.", ServerConfig, true);
+                Logging.Log("Unsubscribing from events.", ModServerConfig, true);
                 NetworkCommunication.RemoveFromNotLogList(DATA_NAMES_TO_IGNORE);
                 if (ServerFunc.IsDedicatedServer()) {
-                    EventManager.Instance.RemoveEventListener("Event_OnClientConnected", Event_OnClientConnected);
-                    EventManager.Instance.RemoveEventListener("Event_OnClientDisconnected", Event_OnClientDisconnected);
-                    EventManager.Instance.RemoveEventListener("Event_OnPlayerRoleChanged", Event_OnPlayerRoleChanged);
-                    EventManager.Instance.RemoveEventListener(Codebase.Constants.STATS_MOD_NAME, Event_OnStatsTrigger);
-                    EventManager.Instance.RemoveEventListener(Codebase.Constants.RULESET_MOD_NAME, Event_OnRulesetTrigger);
+                    EventManager.RemoveEventListener("Event_Everyone_OnClientConnected", Event_OnClientConnected);
+                    EventManager.RemoveEventListener("Event_Everyone_OnClientDisconnected", Event_OnClientDisconnected);
+                    EventManager.RemoveEventListener("Event_Everyone_OnPlayerGameStateChanged", Event_OnPlayerRoleChanged);
+                    EventManager.RemoveEventListener("Event_Everyone_OnGameStateChanged", Event_Everyone_OnGameStateChanged);
+                    EventManager.RemoveEventListener(Codebase.Constants.STATS_MOD_NAME, Event_OnStatsTrigger);
+                    EventManager.RemoveEventListener(Codebase.Constants.RULESET_MOD_NAME, Event_OnRulesetTrigger);
                     NetworkManager.Singleton?.CustomMessagingManager?.UnregisterNamedMessageHandler(Constants.FROM_CLIENT_TO_SERVER);
                 }
                 else {
-                    EventManager.Instance.RemoveEventListener("Event_Client_OnClientStopped", Event_Client_OnClientStopped);
+                    EventManager.RemoveEventListener("Event_OnClientStopped", Event_Client_OnClientStopped);
                     Event_Client_OnClientStopped(new Dictionary<string, object>());
                     NetworkManager.Singleton?.CustomMessagingManager?.UnregisterNamedMessageHandler(Constants.FROM_SERVER_TO_CLIENT);
                 }
@@ -2915,18 +3399,48 @@ namespace oomtm450PuckMod_Stats {
 
                 ScoreboardModifications(false);
 
-                _harmony.UnpatchSelf();
+                UnpatchHarmonySafely();
 
-                Logging.Log($"Disabled.", ServerConfig, true);
-
-                _harmonyPatched = false;
-                _logic = true;
+                Logging.Log($"Disabled.", ModServerConfig, true);
+#if DEBUG_MODE
+                DebugTrace.Section("LIFECYCLE");
+                DebugTrace.Write("LIFECYCLE", "OnDisable called ? final flush.");
+                DebugTrace.Flush();
+#endif
                 return true;
             }
             catch (Exception ex) {
-                Logging.LogError($"Failed to disable.\n{ex}", ServerConfig);
-                return false;
+                Logging.LogError($"Failed to disable.\n{ex}", ModServerConfig);
+                return true;
             }
+            finally {
+                _harmonyPatched = false;
+                _logic = true;
+            }
+        }
+
+        /// <summary>
+        /// Removes Harmony patches. UnpatchSelf can throw on open generic targets (e.g. BaseGameMode`1);
+        /// fall back to per-type unpatch so leaving a server always clears client patches.
+        /// </summary>
+        private static void UnpatchHarmonySafely() {
+            try {
+                _harmony.UnpatchSelf();
+                return;
+            }
+            catch (Exception ex) {
+                Logging.LogError($"Harmony UnpatchSelf failed, falling back to per-type unpatch: {ex.Message}", ModServerConfig);
+            }
+
+            foreach (var target in _harmonyPatchTargets.ToList()) {
+                try {
+                    _harmony.Unpatch(target, HarmonyPatchType.All, Constants.MOD_NAME);
+                }
+                catch (Exception ex) {
+                    Logging.LogError($"Failed to unpatch {target?.DeclaringType?.Name}.{target?.Name}: {ex.Message}", ModServerConfig);
+                }
+            }
+            _harmonyPatchTargets.Clear();
         }
         #endregion
 
@@ -2938,11 +3452,9 @@ namespace oomtm450PuckMod_Stats {
 
                     switch (kvp.Key) {
                         case Codebase.Constants.SOG:
-                            _sendSavePercDuringGoalNextFrame_Player = PlayerManager.Instance.GetPlayerBySteamId(value);
-                            if (_sendSavePercDuringGoalNextFrame_Player == null || !_sendSavePercDuringGoalNextFrame_Player)
-                                Logging.LogError($"{nameof(_sendSavePercDuringGoalNextFrame_Player)} is null.", ServerConfig);
-                            else
-                                _sendSavePercDuringGoalNextFrame = true;
+                            // Goalie save% on goals is updated by GameManager_Server_GoalScored_Patch only.
+                            // Do not schedule SendSavePercDuringGoal here — the game fires SOG on saves
+                            // too, which produced phantom shots faced (SF > saves + GA).
                             break;
 
                         case Codebase.Constants.LOGIC:
@@ -2952,7 +3464,7 @@ namespace oomtm450PuckMod_Stats {
                 }
             }
             catch (Exception ex) {
-                Logging.LogError($"Error in {nameof(Event_OnStatsTrigger)}.\n{ex}", ServerConfig);
+                Logging.LogError($"Error in {nameof(Event_OnStatsTrigger)}.\n{ex}", ModServerConfig);
             }
         }
 
@@ -2969,7 +3481,7 @@ namespace oomtm450PuckMod_Stats {
                 }
             }
             catch (Exception ex) {
-                Logging.LogError($"Error in {nameof(Event_OnRulesetTrigger)}.\n{ex}", ServerConfig);
+                Logging.LogError($"Error in {nameof(Event_OnRulesetTrigger)}.\n{ex}", ModServerConfig);
             }
         }
 
@@ -2982,13 +3494,14 @@ namespace oomtm450PuckMod_Stats {
             if (!ServerFunc.IsDedicatedServer())
                 return;
 
-            //Logging.Log("Event_OnClientConnected", ServerConfig);
+            //Logging.Log("Event_Everyone_OnClientConnected", ModServerConfig);
 
             try {
                 Server_RegisterNamedMessageHandler();
 
                 ulong clientId = (ulong)message["clientId"];
-                string clientSteamId = PlayerManager.Instance.GetPlayerByClientId(clientId).SteamId.Value.ToString();
+                Player connectedPlayer = PlayerManager.Instance.GetPlayerByClientId(clientId);
+                string clientSteamId = connectedPlayer?.SteamId.Value.Value ?? "";
                 try {
                     _players_ClientId_SteamId.Add(clientId, "");
                 }
@@ -2997,13 +3510,13 @@ namespace oomtm450PuckMod_Stats {
                     _players_ClientId_SteamId.Add(clientId, "");
                 }
 
-                // Send version check to client (optional - for compatibility checking)
-                NetworkCommunication.SendData(Constants.MOD_NAME + "_" + nameof(MOD_VERSION), MOD_VERSION, clientId, Constants.FROM_SERVER_TO_CLIENT, ServerConfig);
+                // Send the required client version so the client can compare and notify the user if outdated
+                NetworkCommunication.SendData(Constants.MOD_NAME + "_" + nameof(MOD_VERSION), COMPATIBLE_CLIENT_VERSION, clientId, Constants.FROM_SERVER_TO_CLIENT, ModServerConfig);
 
                 CheckForRulesetMod();
             }
             catch (Exception ex) {
-                Logging.LogError($"Error in {nameof(Event_OnClientConnected)}.\n{ex}", ServerConfig);
+                Logging.LogError($"Error in {nameof(Event_OnClientConnected)}.\n{ex}", ModServerConfig);
             }
         }
 
@@ -3016,7 +3529,7 @@ namespace oomtm450PuckMod_Stats {
             if (!ServerFunc.IsDedicatedServer())
                 return;
 
-            //Logging.Log("Event_OnClientDisconnected", ServerConfig);
+            //Logging.Log("Event_Everyone_OnClientDisconnected", ModServerConfig);
 
             try {
                 ulong clientId = (ulong)message["clientId"];
@@ -3025,11 +3538,9 @@ namespace oomtm450PuckMod_Stats {
                     clientSteamId = _players_ClientId_SteamId[clientId];
                 }
                 catch {
-                    Logging.LogError($"Client Id {clientId} steam Id not found in {nameof(_players_ClientId_SteamId)}.", ServerConfig);
+                    Logging.LogError($"Client Id {clientId} steam Id not found in {nameof(_players_ClientId_SteamId)}.", ModServerConfig);
                     return;
                 }
-
-                _sentOutOfDateMessage.Remove(clientId);
 
                 _playerIsDown.Remove(clientSteamId);
                 _playersCurrentPuckTouch.Remove(clientSteamId);
@@ -3037,9 +3548,11 @@ namespace oomtm450PuckMod_Stats {
                 _lastTimeOnCollisionStayOrExitWasCalled.Remove(clientSteamId);
 
                 _players_ClientId_SteamId.Remove(clientId);
+                _pendingVersionMismatch.Remove(clientId);
+                _clientReportedModVersions.Remove(clientId);
             }
             catch (Exception ex) {
-                Logging.LogError($"Error in {nameof(Event_OnClientDisconnected)}.\n{ex}", ServerConfig);
+                Logging.LogError($"Error in {nameof(Event_OnClientDisconnected)}.\n{ex}", ModServerConfig);
             }
         }
 
@@ -3052,10 +3565,10 @@ namespace oomtm450PuckMod_Stats {
             if (NetworkManager.Singleton == null || ServerFunc.IsDedicatedServer())
                 return;
 
-            //Logging.Log("Event_Client_OnClientStopped", _clientConfig);
+            //Logging.Log("Event_OnClientStopped", _clientConfig);
 
             try {
-                ServerConfig = new ServerConfig();
+                ModServerConfig = new ModServerConfig();
 
                 _serverHasResponded = false;
                 _askServerForStartupDataCount = 0;
@@ -3102,25 +3615,53 @@ namespace oomtm450PuckMod_Stats {
             // Use the event to link client Ids to Steam Ids.
             Dictionary<ulong, string> players_ClientId_SteamId_ToChange = new Dictionary<ulong, string>();
             foreach (var kvp in _players_ClientId_SteamId) {
-                if (string.IsNullOrEmpty(kvp.Value))
-                    players_ClientId_SteamId_ToChange.Add(kvp.Key, PlayerManager.Instance.GetPlayerByClientId(kvp.Key).SteamId.Value.ToString());
+                if (string.IsNullOrEmpty(kvp.Value)) {
+                    Player p = PlayerManager.Instance.GetPlayerByClientId(kvp.Key);
+                    if (p != null)
+                        players_ClientId_SteamId_ToChange.Add(kvp.Key, p.SteamId.Value.Value);
+                }
             }
 
             foreach (var kvp in players_ClientId_SteamId_ToChange) {
                 if (!string.IsNullOrEmpty(kvp.Value)) {
                     _players_ClientId_SteamId[kvp.Key] = kvp.Value;
-                    Logging.Log($"Added clientId {kvp.Key} linked to Steam Id {kvp.Value}.", ServerConfig);
+                    Logging.Log($"Added clientId {kvp.Key} linked to Steam Id {kvp.Value}.", ModServerConfig);
+                }
+
+                // Fire any pending version-mismatch broadcast now that the player's name is populated.
+                if (_pendingVersionMismatch.TryGetValue(kvp.Key, out string pendingClientVersion)) {
+                    _pendingVersionMismatch.Remove(kvp.Key);
+                    if (IsClientModVersionOutdated(pendingClientVersion, COMPATIBLE_CLIENT_VERSION)) {
+                        try {
+                            Player outdatedPlayer = PlayerManager.Instance?.GetPlayerByClientId(kvp.Key);
+                            string outdatedName = (outdatedPlayer != null && !string.IsNullOrEmpty(outdatedPlayer.Username.Value.Value))
+                                ? outdatedPlayer.Username.Value.Value
+                                : $"Client {kvp.Key}";
+                            string clientVersionDisplay = pendingClientVersion == "1" ? "unknown/legacy" : $"v{pendingClientVersion}";
+                            NetworkBehaviourSingleton<ChatManager>.Instance?.Server_BroadcastChatMessage(
+                                $"{outdatedName} has an outdated stats mod! ({clientVersionDisplay}, server expects v{COMPATIBLE_CLIENT_VERSION})");
+                        } catch (Exception broadcastEx) {
+                            Logging.LogError($"Error broadcasting deferred version mismatch for clientId={kvp.Key}: {broadcastEx.Message}", ModServerConfig);
+                        }
+                    }
                 }
             }
 
             Player player = (Player)message["player"];
 
-            string playerSteamId = player.SteamId.Value.ToString();
+            string playerSteamId = player.SteamId.Value.Value;
 
             if (string.IsNullOrEmpty(playerSteamId))
                 return;
 
-            PlayerRole newRole = (PlayerRole)message["newRole"];
+            // Event_Everyone_OnPlayerGameStateChanged fires for any game state change (phase/team/role).
+            // Extract role from the new game state and only proceed if the role actually changed.
+            PlayerGameState newGameState = (PlayerGameState)message["newGameState"];
+            PlayerGameState oldGameState = (PlayerGameState)message["oldGameState"];
+            PlayerRole newRole = newGameState.Role;
+
+            if (oldGameState.Role == newRole)
+                return;
 
             if (newRole != PlayerRole.Goalie) {
                 if (!_sog.TryGetValue(playerSteamId, out int _))
@@ -3235,6 +3776,12 @@ namespace oomtm450PuckMod_Stats {
                 float gameTimeToUse = blockGameTime > 0f ? blockGameTime : GetCurrentGameTime();
                 RecordPlayByPlayEventInternal(PlayByPlayEventType.Block, blocker, puckPos, puckVel, blockOutcome, null, null, false, gameTimeToUse);
             }
+
+            // Successful block = puck never became a scoring chance for the goalie. Wipe any
+            // save/SF credit that was recorded before the block was finalized (e.g. brief goalie
+            // contact then teammate block, or phantom ++shots from legacy SOG triggers).
+            if (blockOutcome == "successful")
+                RevertGoalieStatsForBlockedShot(shooterTeam, shooterSteamId, blockGameTime);
         }
 
         private static void ProcessTakeaways(string takeawaySteamId) {
@@ -3259,7 +3806,7 @@ namespace oomtm450PuckMod_Stats {
             // Track team takeaway stat
             Player takeawayPlayer = PlayerManager.Instance.GetPlayerBySteamId(takeawaySteamId);
             if (takeawayPlayer != null && takeawayPlayer) {
-                PlayerTeam playerTeam = takeawayPlayer.Team.Value;
+                PlayerTeam playerTeam = takeawayPlayer.Team;
                 if (!_teamTakeaways.TryGetValue(playerTeam, out int _))
                     _teamTakeaways.Add(playerTeam, 0);
                 _teamTakeaways[playerTeam] += 1;
@@ -3286,7 +3833,7 @@ namespace oomtm450PuckMod_Stats {
                 Vector3 puckVel = puck.GetComponent<Rigidbody>()?.velocity ?? Vector3.zero;
                 
                 // Determine current zone (for tracking purposes only - flags added retroactively)
-                EventZone currentZone = DetermineEventZone(puckPos, player.Team.Value);
+                EventZone currentZone = DetermineEventZone(puckPos, player.Team);
                 
                 // Update last zone for this player (always update, even if moving backwards or in cooldown)
                 // This ensures we track zone changes even when touches are on cooldown
@@ -3302,7 +3849,7 @@ namespace oomtm450PuckMod_Stats {
                         if (_lastEvent != null && 
                             _lastEvent.EventType == PlayByPlayEventType.Touch &&
                             _lastEvent.PlayerSteamId != playerSteamId &&
-                            _lastEvent.PlayerTeam == (int)player.Team.Value) {
+                            _lastEvent.PlayerTeam == (int)player.Team) {
                             // Check time window (6 seconds, same as pass detection)
                             double timeSinceLastTouchMs = (DateTime.UtcNow - _lastEvent.Timestamp).TotalMilliseconds;
                             if (timeSinceLastTouchMs < 6000) {
@@ -3331,7 +3878,7 @@ namespace oomtm450PuckMod_Stats {
                                 
                                 // Track team pass stat
                                 if (passer != null && passer && !PlayerFunc.IsGoalie(passer)) {
-                                    PlayerTeam playerTeam = passer.Team.Value;
+                                    PlayerTeam playerTeam = passer.Team;
                                     if (!_teamPasses.TryGetValue(playerTeam, out int _))
                                         _teamPasses.Add(playerTeam, 0);
                                     _teamPasses[playerTeam] += 1;
@@ -3532,7 +4079,7 @@ namespace oomtm450PuckMod_Stats {
                 return;
             
             // Only check when new team hits their 2nd event (_currentPlayInPossession == 1)
-            if (_currentPlayInPossession != 1 || _currentTeamInPossession != player.Team.Value)
+            if (_currentPlayInPossession != 1 || _currentTeamInPossession != player.Team)
                 return;
             
             // Prevent re-entrancy - if we're already validating, don't validate again
@@ -3548,7 +4095,7 @@ namespace oomtm450PuckMod_Stats {
                     // Check the last few events to see if a turnover/takeaway was already recorded
                     int checkCount = Math.Min(5, _playByPlayEvents.Count);
                     for (int i = _playByPlayEvents.Count - 1; i >= _playByPlayEvents.Count - checkCount; i--) {
-                        if (_playByPlayEvents[i].PlayerTeam == (int)player.Team.Value &&
+                        if (_playByPlayEvents[i].PlayerTeam == (int)player.Team &&
                             (_playByPlayEvents[i].EventType == PlayByPlayEventType.Takeaway ||
                              _playByPlayEvents[i].EventType == PlayByPlayEventType.Turnover)) {
                             // Already recorded a turnover/takeaway for this team - skip to prevent duplicates
@@ -3563,7 +4110,7 @@ namespace oomtm450PuckMod_Stats {
                 if (_playByPlayEvents.Count > 1) {
                     // Look backwards from the current event to find when team changed
                     for (int i = _playByPlayEvents.Count - 2; i >= 0 && i >= _playByPlayEvents.Count - 22; i--) {
-                        if (_playByPlayEvents[i].PlayerTeam != (int)player.Team.Value) {
+                        if (_playByPlayEvents[i].PlayerTeam != (int)player.Team) {
                             previousTeam = (PlayerTeam)_playByPlayEvents[i].PlayerTeam;
                             break;
                         }
@@ -3571,15 +4118,15 @@ namespace oomtm450PuckMod_Stats {
                 }
                 
                 // If no previous team found, try using _lastPossession as fallback
-                if (previousTeam == PlayerTeam.None && _lastPossession.Team != PlayerTeam.None && _lastPossession.Team != player.Team.Value) {
+                if (previousTeam == PlayerTeam.None && _lastPossession.Team != PlayerTeam.None && _lastPossession.Team != player.Team) {
                     previousTeam = _lastPossession.Team;
                 }
                 
                 // Check if possession changed (different team than current)
-                if (previousTeam == PlayerTeam.None || previousTeam == player.Team.Value)
+                if (previousTeam == PlayerTeam.None || previousTeam == player.Team)
                     return; // No possession change or same team
                 
-                string currentPlayerSteamId = player.SteamId.Value.ToString();
+                string currentPlayerSteamId = player.SteamId.Value.Value;
                 
                 // Find the first successful touch from the new team (the takeaway player)
                 // Look for the first event from the new team in the current possession (excluding hits)
@@ -3603,7 +4150,7 @@ namespace oomtm450PuckMod_Stats {
                     // The 1-second delay below ensures retroactive updates have time to occur
                     float earliestNewTeamGameTime = float.MaxValue;
                     for (int i = 0; i < _playByPlayEvents.Count; i++) {
-                        if (_playByPlayEvents[i].PlayerTeam == (int)player.Team.Value) {
+                        if (_playByPlayEvents[i].PlayerTeam == (int)player.Team) {
                             // Only consider events that occur after the last previous team event
                             if (_playByPlayEvents[i].GameTime > lastPreviousTeamGameTime) {
                                 string outcome = _playByPlayEvents[i].Outcome ?? "";
@@ -3642,27 +4189,31 @@ namespace oomtm450PuckMod_Stats {
                 // Find the last successful play from the previous team (before the new team's possession started)
                 PlayByPlayEvent lastSuccessfulPlay = null;
                 if (_playByPlayEvents.Count > 1) {
+                    bool inPreviousTeamSegment = false;
                     for (int i = _playByPlayEvents.Count - 2; i >= 0 && i >= _playByPlayEvents.Count - 22; i--) {
-                        if (_playByPlayEvents[i].PlayerTeam == (int)previousTeam) {
+                        int eventTeam = _playByPlayEvents[i].PlayerTeam;
+                        if (eventTeam == (int)previousTeam) {
+                            inPreviousTeamSegment = true;
                             string outcome = _playByPlayEvents[i].Outcome ?? "";
                             if (outcome == "successful" || outcome == "neutral" || outcome == "") {
                                 lastSuccessfulPlay = _playByPlayEvents[i];
                                 break;
                             }
-                            // Continue searching backwards even if this event is failed - we want the last successful one
+                        } else if (inPreviousTeamSegment) {
+                            break;
                         }
-                        // Don't break on different team - continue searching backwards to find previous team's events
                     }
                 }
                 
-                // Check if last successful play was recent (within 4 seconds)
+                // Check if last successful play was recent (within 6 seconds)
+                const float POSSESSION_CHANGE_WINDOW_SECONDS = 6.0f;
                 bool recentPossessionChange = false;
                 if (lastSuccessfulPlay != null && _playByPlayEvents.Count > 0) {
                     float newTeamTouchTime = _playByPlayEvents[_playByPlayEvents.Count - 1].GameTime;
                     float timeSinceLastSuccessfulPlay = newTeamTouchTime - lastSuccessfulPlay.GameTime;
-                    recentPossessionChange = timeSinceLastSuccessfulPlay <= 4.0f;
+                    recentPossessionChange = timeSinceLastSuccessfulPlay <= POSSESSION_CHANGE_WINDOW_SECONDS;
                 } else {
-                    recentPossessionChange = (DateTime.UtcNow - _lastPossession.Date).TotalMilliseconds < 4000;
+                    recentPossessionChange = (DateTime.UtcNow - _lastPossession.Date).TotalMilliseconds < POSSESSION_CHANGE_WINDOW_SECONDS * 1000;
                 }
                 
                 if (!recentPossessionChange)
@@ -3676,22 +4227,23 @@ namespace oomtm450PuckMod_Stats {
                     }
                 }
                 
-                // Fallback: count consecutive successful events from previous team
-                // Search backwards through events, counting consecutive successful events from previous team
+                // Fallback: count consecutive successful events from previous team's last possession only
                 if (previousPlayCount == 0 && _playByPlayEvents.Count > 1) {
                     int count = 0;
+                    bool inPreviousTeamSegment = false;
                     for (int i = _playByPlayEvents.Count - 2; i >= 0 && i >= _playByPlayEvents.Count - 22; i--) {
-                        if (_playByPlayEvents[i].PlayerTeam == (int)previousTeam) {
+                        int eventTeam = _playByPlayEvents[i].PlayerTeam;
+                        if (eventTeam == (int)previousTeam) {
+                            inPreviousTeamSegment = true;
                             string outcome = _playByPlayEvents[i].Outcome ?? "";
                             if (outcome == "successful" || outcome == "neutral" || outcome == "") {
                                 count++;
                             } else {
-                                // Stop counting when we hit a failed event (breaks consecutive chain)
                                 break;
                             }
+                        } else if (inPreviousTeamSegment) {
+                            break;
                         }
-                        // Continue searching backwards even if we hit different team's events
-                        // (we want to find all previous team's consecutive successful events)
                     }
                     previousPlayCount = count;
                 }
@@ -3808,8 +4360,8 @@ namespace oomtm450PuckMod_Stats {
                         Vector3 puckVel = pairedPuck.GetComponent<Rigidbody>()?.velocity ?? Vector3.zero;
                         
                         // Use the team of each player directly - takeaway player's team (new team), turnover player's team (old team)
-                        string takeawayTeamInPossession = (takeawayPlayer.Team.Value == PlayerTeam.Blue ? "Blue" : "Red");
-                        string turnoverTeamInPossession = (turnoverPlayer.Team.Value == PlayerTeam.Blue ? "Blue" : "Red");
+                        string takeawayTeamInPossession = (takeawayPlayer.Team == PlayerTeam.Blue ? "Blue" : "Red");
+                        string turnoverTeamInPossession = (turnoverPlayer.Team == PlayerTeam.Blue ? "Blue" : "Red");
                         
                         // Record both events with calculated GameTime (placed between last previous team event and first new team event)
                         RecordPlayByPlayEventInternal(PlayByPlayEventType.Takeaway, takeawayPlayer, puckPos, puckVel, "successful", "", null, skipPossessionReset: true, gameTimeOverride: turnoverGameTime > 0 ? turnoverGameTime : (float?)null, teamInPossessionOverride: takeawayTeamInPossession);
@@ -3861,7 +4413,7 @@ namespace oomtm450PuckMod_Stats {
             // Track team turnover stat
             Player turnoverPlayer = PlayerManager.Instance.GetPlayerBySteamId(turnoverSteamId);
             if (turnoverPlayer != null && turnoverPlayer) {
-                PlayerTeam playerTeam = turnoverPlayer.Team.Value;
+                PlayerTeam playerTeam = turnoverPlayer.Team;
                 if (!_teamTurnovers.TryGetValue(playerTeam, out int _))
                     _teamTurnovers.Add(playerTeam, 0);
                 _teamTurnovers[playerTeam] += 1;
@@ -3906,7 +4458,7 @@ namespace oomtm450PuckMod_Stats {
                 // Decrement team turnover stat
                 Player player = PlayerManager.Instance.GetPlayerBySteamId(playerSteamId);
                 if (player != null && player) {
-                    PlayerTeam playerTeam = player.Team.Value;
+                    PlayerTeam playerTeam = player.Team;
                     if (_teamTurnovers.TryGetValue(playerTeam, out int teamTurnoverCount) && teamTurnoverCount > 0) {
                         _teamTurnovers[playerTeam] = teamTurnoverCount - 1;
                         QueueStatUpdate(Codebase.Constants.TEAM_TURNOVERS + playerTeam.ToString(), _teamTurnovers[playerTeam].ToString());
@@ -3924,7 +4476,7 @@ namespace oomtm450PuckMod_Stats {
                     // Decrement team takeaway stat
                     Player takeawayPlayer = PlayerManager.Instance.GetPlayerBySteamId(takeawaySteamId);
                     if (takeawayPlayer != null && takeawayPlayer) {
-                        PlayerTeam takeawayTeam = takeawayPlayer.Team.Value;
+                        PlayerTeam takeawayTeam = takeawayPlayer.Team;
                         if (_teamTakeaways.TryGetValue(takeawayTeam, out int teamTakeawayCount) && teamTakeawayCount > 0) {
                             _teamTakeaways[takeawayTeam] = teamTakeawayCount - 1;
                             QueueStatUpdate(Codebase.Constants.TEAM_TAKEAWAYS + takeawayTeam.ToString(), _teamTakeaways[takeawayTeam].ToString());
@@ -4085,7 +4637,7 @@ namespace oomtm450PuckMod_Stats {
                 PlayerTeam scoringTeam = (PlayerTeam)goalEvent.PlayerTeam;
                 if (scoringTeam == PlayerTeam.None)
                     continue;
-                
+
                 PlayerTeam opposingTeam = scoringTeam == PlayerTeam.Blue ? PlayerTeam.Red : PlayerTeam.Blue;
                 
                 // Extract all skaters on ice from roster data
@@ -4155,7 +4707,7 @@ namespace oomtm450PuckMod_Stats {
             // Track team stat
             Player winnerPlayer = PlayerManager.Instance.GetPlayerBySteamId(winnerSteamId);
             if (winnerPlayer != null && winnerPlayer && !PlayerFunc.IsGoalie(winnerPlayer)) {
-                PlayerTeam winnerTeam = winnerPlayer.Team.Value;
+                PlayerTeam winnerTeam = winnerPlayer.Team;
                 if (!_teamPuckBattleWins.TryGetValue(winnerTeam, out int _))
                     _teamPuckBattleWins.Add(winnerTeam, 0);
                 _teamPuckBattleWins[winnerTeam] += 1;
@@ -4178,7 +4730,7 @@ namespace oomtm450PuckMod_Stats {
             // Track team stat
             Player loserPlayer = PlayerManager.Instance.GetPlayerBySteamId(loserSteamId);
             if (loserPlayer != null && loserPlayer && !PlayerFunc.IsGoalie(loserPlayer)) {
-                PlayerTeam loserTeam = loserPlayer.Team.Value;
+                PlayerTeam loserTeam = loserPlayer.Team;
                 if (!_teamPuckBattleLosses.TryGetValue(loserTeam, out int _))
                     _teamPuckBattleLosses.Add(loserTeam, 0);
                 _teamPuckBattleLosses[loserTeam] += 1;
@@ -4188,7 +4740,7 @@ namespace oomtm450PuckMod_Stats {
 
         private static void Server_RegisterNamedMessageHandler() {
             if (NetworkManager.Singleton != null && NetworkManager.Singleton.CustomMessagingManager != null && !_hasRegisteredWithNamedMessageHandler) {
-                Logging.Log($"RegisterNamedMessageHandler {Constants.FROM_CLIENT_TO_SERVER}.", ServerConfig);
+                Logging.Log($"RegisterNamedMessageHandler {Constants.FROM_CLIENT_TO_SERVER}.", ModServerConfig);
                 NetworkManager.Singleton.CustomMessagingManager.RegisterNamedMessageHandler(Constants.FROM_CLIENT_TO_SERVER, ReceiveData);
 
                 _hasRegisteredWithNamedMessageHandler = true;
@@ -4196,12 +4748,12 @@ namespace oomtm450PuckMod_Stats {
         }
 
         private static void CheckForRulesetMod() {
-            if (ModManagerV2.Instance == null || ModManagerV2.Instance.EnabledModIds == null || (_rulesetModEnabled != null && (bool)_rulesetModEnabled))
+            if (_rulesetModEnabled != null && (bool)_rulesetModEnabled)
                 return;
 
-            _rulesetModEnabled = ModManagerV2.Instance.EnabledModIds.Contains(3501446576) ||
-                                 ModManagerV2.Instance.EnabledModIds.Contains(3500559233);
-            Logging.Log($"Ruleset mod is enabled : {_rulesetModEnabled}.", ServerConfig, true);
+            _rulesetModEnabled = ModManager.GetModById("3501446576") != null ||
+                                 ModManager.GetModById("3500559233") != null;
+            Logging.Log($"Ruleset mod is enabled : {_rulesetModEnabled}.", ModServerConfig, true);
         }
 
         /// <summary>
@@ -4215,77 +4767,96 @@ namespace oomtm450PuckMod_Stats {
                 if (clientId == NetworkManager.ServerClientId) // If client Id is 0, we received data from the server, so we are client-sided.
                     (dataName, dataStr) = NetworkCommunication.GetData(clientId, reader, _clientConfig);
                 else
-                    (dataName, dataStr) = NetworkCommunication.GetData(clientId, reader, ServerConfig);
+                    (dataName, dataStr) = NetworkCommunication.GetData(clientId, reader, ModServerConfig);
+
+                // Normalize corrupted RESET_ALL (defense-in-depth if send uses ReliableSequenced)
+                bool isClientFromServer = clientId == NetworkManager.ServerClientId;
+                bool isShortUnstructuredPayload = dataStr != null && dataStr.Length <= 4 && !dataStr.Contains(';');
+                bool couldBeCorruptedReset = isClientFromServer && dataName != null && dataName.StartsWith(Constants.MOD_NAME) && dataName != RESET_ALL
+                    && dataName.Length <= Constants.MOD_NAME.Length + 5
+                    && (dataStr == "1" || isShortUnstructuredPayload);
+                if (couldBeCorruptedReset) {
+                    dataName = RESET_ALL;
+                    dataStr = "1";
+                }
 
                 switch (dataName) {
-                    case Constants.MOD_NAME + "_" + nameof(MOD_VERSION): // CLIENT-SIDE : Mod version check, kick if client and server versions are not the same.
+                    case Constants.MOD_NAME + "_" + nameof(MOD_VERSION): // CLIENT-SIDE: server sends the required client version; compare and notify if outdated.
                         _serverHasResponded = true;
-                        if (MOD_VERSION == dataStr) {
-                            // Server has the mod - set up tooltips if scoreboard is ready
-                            if (UIScoreboard.Instance != null) {
-                                VisualElement scoreboardContainer = SystemFunc.GetPrivateField<VisualElement>(typeof(UIScoreboard), UIScoreboard.Instance, "container");
-                                if (scoreboardContainer != null && !_hasUpdatedUIScoreboard.Contains("header")) {
-                                    ScoreboardModifications(true);
-                                } else if (scoreboardContainer != null && _hasUpdatedUIScoreboard.Contains("header") && _teamTooltips.Count == 0) {
-                                    // Scoreboard is set up but team tooltips aren't - set them up now
-                                    SetupTeamTooltips(scoreboardContainer);
-                                }
-                                
-                                // Ensure tooltips are created for all existing players now that server has responded
-                                // Call ScoreboardModifications again to create tooltips for players that don't have them
-                                if (_hasUpdatedUIScoreboard.Contains("header") && scoreboardContainer != null) {
-                                    // Schedule tooltip creation for existing players
-                                    scoreboardContainer.schedule.Execute(() => {
-                                        // This will iterate through all players and create tooltips for those that don't have them
-                                        ScoreboardModifications(true);
-                                    }).ExecuteLater(100); // Small delay to ensure scoreboard is ready
-                                }
+#if DEBUG_MODE
+                        DebugTrace.Section("NETWORK HANDSHAKE");
+                        DebugTrace.Write("NETWORK", $"CLIENT received required version from server. required='{dataStr}' ours='{MOD_VERSION}' match={MOD_VERSION == dataStr}");
+#endif
+                        // Always activate the mod regardless of version — outdated clients still get
+                        // partial functionality. A mismatch just shows an in-chat update nudge.
+                        if (MonoBehaviourSingleton<UIManager>.Instance.Scoreboard != null) {
+                            VisualElement scoreboardContainer = SystemFunc.GetPrivateField<VisualElement>(typeof(UIScoreboard), MonoBehaviourSingleton<UIManager>.Instance.Scoreboard, "scoreboard");
+#if DEBUG_MODE
+                            DebugTrace.Write("NETWORK", $"Scoreboard init: scoreboardContainer={scoreboardContainer != null} headerAlreadySet={_hasUpdatedUIScoreboard.Contains("header")} teamTooltipCount={_teamTooltips.Count}");
+#endif
+                            if (scoreboardContainer != null && !_hasUpdatedUIScoreboard.Contains("header")) {
+                                ScoreboardModifications(true);
+                            } else if (scoreboardContainer != null && _hasUpdatedUIScoreboard.Contains("header") && _teamTooltips.Count == 0) {
+                                SetupTeamTooltips(scoreboardContainer);
                             }
-                            break;
+                            if (_hasUpdatedUIScoreboard.Contains("header") && scoreboardContainer != null) {
+                                scoreboardContainer.schedule.Execute(() => {
+                                    ScoreboardModifications(true);
+                                }).ExecuteLater(100);
+                            }
                         }
-                        else if (OLD_MOD_VERSIONS.Contains(dataStr)) {
-                            _addServerModVersionOutOfDateMessage = true;
-                            break;
+#if DEBUG_MODE
+                        else {
+                            DebugTrace.Write("NETWORK", "Scoreboard is NULL on version receive — tooltips will init on next StylePlayer patch.");
                         }
-
-                        _askForKick = true;
+#endif
                         break;
 
-                    case Constants.MOD_NAME + "_kick": // SERVER-SIDE : Kick the client that asked to be kicked.
+                    case Constants.MOD_NAME + "_kick": // SERVER-SIDE: old clients (pre-graceful-update code) send this when their version doesn't match.
+                        // Do NOT kick — just broadcast a public notice so the server is aware and the player knows to update.
                         if (dataStr != "1")
                             break;
-
-                        //NetworkManager.Singleton.DisconnectClient(clientId,
-                        //$"Mod is out of date. Please unsubscribe from {Constants.WORKSHOP_MOD_NAME} in the workshop and restart your game to update.");
-
-                        if (!_sentOutOfDateMessage.TryGetValue(clientId, out DateTime lastCheckTime)) {
-                            lastCheckTime = DateTime.MinValue;
-                            _sentOutOfDateMessage.Add(clientId, lastCheckTime);
-                        }
-
-                        DateTime utcNow = DateTime.UtcNow;
-                        if (lastCheckTime + TimeSpan.FromSeconds(900) < utcNow) {
-                            if (string.IsNullOrEmpty(PlayerManager.Instance.GetPlayerByClientId(clientId).Username.Value.ToString()))
-                                break;
-
-                            Logging.Log($"Warning client {clientId} mod out of date.", ServerConfig);
-                            UIChat.Instance.Server_SendSystemChatMessage($"{PlayerManager.Instance.GetPlayerByClientId(clientId).Username.Value} : {Constants.WORKSHOP_MOD_NAME} Mod is out of date. Please unsubscribe from {Constants.WORKSHOP_MOD_NAME} in the workshop and restart your game to update.");
-                            _sentOutOfDateMessage[clientId] = utcNow;
-                        }
+                        try {
+                            Player outdatedPlayer = PlayerManager.Instance.GetPlayerByClientId(clientId);
+                            if (outdatedPlayer != null && !string.IsNullOrEmpty(outdatedPlayer.Username.Value.Value))
+                                Logging.Log($"Client {clientId} ({outdatedPlayer.Username.Value.Value}) has outdated Stats mod — ignoring kick request.", ModServerConfig);
+                        } catch { }
                         break;
 
-                    case Constants.ASK_SERVER_FOR_STARTUP_DATA: // SERVER-SIDE : Send the necessary data to client.
-                        if (dataStr != "1")
+                    case Constants.ASK_SERVER_FOR_STARTUP_DATA: // SERVER-SIDE : client sends its MOD_VERSION; respond with our required version + batch stats.
+                        if (string.IsNullOrEmpty(dataStr))
                             break;
+#if DEBUG_MODE
+                        DebugTrace.Section("NETWORK HANDSHAKE");
+                        DebugTrace.Write("NETWORK", $"SERVER received ASK_SERVER_FOR_STARTUP_DATA from clientId={clientId} clientVersion='{dataStr}'. Sending COMPATIBLE_CLIENT_VERSION={COMPATIBLE_CLIENT_VERSION}");
+                        DebugTrace.Flush();
+#endif
+                        NetworkCommunication.SendData(Constants.MOD_NAME + "_" + nameof(MOD_VERSION), COMPATIBLE_CLIENT_VERSION, clientId, Constants.FROM_SERVER_TO_CLIENT, ModServerConfig);
 
-                        NetworkCommunication.SendData(Constants.MOD_NAME + "_" + nameof(MOD_VERSION), MOD_VERSION, clientId, Constants.FROM_SERVER_TO_CLIENT, ServerConfig);
+                        if (_clientReportedModVersions.TryGetValue(clientId, out string _))
+                            _clientReportedModVersions[clientId] = dataStr;
+                        else
+                            _clientReportedModVersions.Add(clientId, dataStr);
+
+                        // Version mismatch — defer the broadcast until Event_OnPlayerRoleChanged where
+                        // the player's Username is guaranteed to be populated.
+                        // Skip when the client is on a newer build than this server (outdated server, not outdated client).
+                        if (IsClientModVersionOutdated(dataStr, COMPATIBLE_CLIENT_VERSION)) {
+                            try {
+                                if (_pendingVersionMismatch.ContainsKey(clientId))
+                                    _pendingVersionMismatch.Remove(clientId);
+                                _pendingVersionMismatch.Add(clientId, dataStr);
+                            } catch (Exception versionEx) {
+                                Logging.LogError($"Error queuing version mismatch for clientId={clientId}: {versionEx.Message}", ModServerConfig);
+                            }
+                        }
 
                         if (_sog.Count != 0) {
                             string batchSOG = "";
                             foreach (string key in new List<string>(_sog.Keys))
                                 batchSOG += key + ';' + _sog[key].ToString() + ';';
                             batchSOG = batchSOG.Remove(batchSOG.Length - 1);
-                            NetworkCommunication.SendData(BATCH_SOG, batchSOG, clientId, Constants.FROM_SERVER_TO_CLIENT, ServerConfig);
+                            NetworkCommunication.SendData(BATCH_SOG, batchSOG, clientId, Constants.FROM_SERVER_TO_CLIENT, ModServerConfig);
                         }
 
                         if (_savePerc.Count != 0) {
@@ -4293,7 +4864,7 @@ namespace oomtm450PuckMod_Stats {
                             foreach (string key in new List<string>(_savePerc.Keys))
                                 batchSavePerc += key + ';' + _savePerc[key].ToString() + ';';
                             batchSavePerc = batchSavePerc.Remove(batchSavePerc.Length - 1);
-                            NetworkCommunication.SendData(BATCH_SAVEPERC, batchSavePerc, clientId, Constants.FROM_SERVER_TO_CLIENT, ServerConfig);
+                            NetworkCommunication.SendData(BATCH_SAVEPERC, batchSavePerc, clientId, Constants.FROM_SERVER_TO_CLIENT, ModServerConfig);
                         }
 
                         if (_hits.Count != 0) {
@@ -4301,7 +4872,7 @@ namespace oomtm450PuckMod_Stats {
                             foreach (string key in new List<string>(_hits.Keys))
                                 batchHits += key + ';' + _hits[key].ToString() + ';';
                             batchHits = batchHits.Remove(batchHits.Length - 1);
-                            NetworkCommunication.SendData(BATCH_HIT, batchHits, clientId, Constants.FROM_SERVER_TO_CLIENT, ServerConfig);
+                            NetworkCommunication.SendData(BATCH_HIT, batchHits, clientId, Constants.FROM_SERVER_TO_CLIENT, ModServerConfig);
                         }
 
                         if (_turnovers.Count != 0) {
@@ -4309,7 +4880,7 @@ namespace oomtm450PuckMod_Stats {
                             foreach (string key in new List<string>(_turnovers.Keys))
                                 batchTurnovers += key + ';' + _turnovers[key].ToString() + ';';
                             batchTurnovers = batchTurnovers.Remove(batchTurnovers.Length - 1);
-                            NetworkCommunication.SendData(BATCH_TURNOVER, batchTurnovers, clientId, Constants.FROM_SERVER_TO_CLIENT, ServerConfig);
+                            NetworkCommunication.SendData(BATCH_TURNOVER, batchTurnovers, clientId, Constants.FROM_SERVER_TO_CLIENT, ModServerConfig);
                         }
 
                         if (_takeaways.Count != 0) {
@@ -4317,7 +4888,7 @@ namespace oomtm450PuckMod_Stats {
                             foreach (string key in new List<string>(_takeaways.Keys))
                                 batchTakeaways += key + ';' + _takeaways[key].ToString() + ';';
                             batchTakeaways = batchTakeaways.Remove(batchTakeaways.Length - 1);
-                            NetworkCommunication.SendData(BATCH_TAKEAWAY, batchTakeaways, clientId, Constants.FROM_SERVER_TO_CLIENT, ServerConfig);
+                            NetworkCommunication.SendData(BATCH_TAKEAWAY, batchTakeaways, clientId, Constants.FROM_SERVER_TO_CLIENT, ModServerConfig);
                         }
 
                         if (_passes.Count != 0) {
@@ -4325,7 +4896,7 @@ namespace oomtm450PuckMod_Stats {
                             foreach (string key in new List<string>(_passes.Keys))
                                 batchPasses += key + ';' + _passes[key].ToString() + ';';
                             batchPasses = batchPasses.Remove(batchPasses.Length - 1);
-                            NetworkCommunication.SendData(BATCH_PASS, batchPasses, clientId, Constants.FROM_SERVER_TO_CLIENT, ServerConfig);
+                            NetworkCommunication.SendData(BATCH_PASS, batchPasses, clientId, Constants.FROM_SERVER_TO_CLIENT, ModServerConfig);
                         }
 
                         if (_puckTouches.Count != 0) {
@@ -4333,7 +4904,7 @@ namespace oomtm450PuckMod_Stats {
                             foreach (string key in new List<string>(_puckTouches.Keys))
                                 batchPuckTouches += key + ';' + _puckTouches[key].ToString() + ';';
                             batchPuckTouches = batchPuckTouches.Remove(batchPuckTouches.Length - 1);
-                            NetworkCommunication.SendData(BATCH_PUCK_TOUCH, batchPuckTouches, clientId, Constants.FROM_SERVER_TO_CLIENT, ServerConfig);
+                            NetworkCommunication.SendData(BATCH_PUCK_TOUCH, batchPuckTouches, clientId, Constants.FROM_SERVER_TO_CLIENT, ModServerConfig);
                         }
 
                         if (_exits.Count != 0) {
@@ -4341,7 +4912,7 @@ namespace oomtm450PuckMod_Stats {
                             foreach (string key in new List<string>(_exits.Keys))
                                 batchExits += key + ';' + _exits[key].ToString() + ';';
                             batchExits = batchExits.Remove(batchExits.Length - 1);
-                            NetworkCommunication.SendData(BATCH_EXIT, batchExits, clientId, Constants.FROM_SERVER_TO_CLIENT, ServerConfig);
+                            NetworkCommunication.SendData(BATCH_EXIT, batchExits, clientId, Constants.FROM_SERVER_TO_CLIENT, ModServerConfig);
                         }
 
                         if (_entries.Count != 0) {
@@ -4349,7 +4920,7 @@ namespace oomtm450PuckMod_Stats {
                             foreach (string key in new List<string>(_entries.Keys))
                                 batchEntries += key + ';' + _entries[key].ToString() + ';';
                             batchEntries = batchEntries.Remove(batchEntries.Length - 1);
-                            NetworkCommunication.SendData(BATCH_ENTRY, batchEntries, clientId, Constants.FROM_SERVER_TO_CLIENT, ServerConfig);
+                            NetworkCommunication.SendData(BATCH_ENTRY, batchEntries, clientId, Constants.FROM_SERVER_TO_CLIENT, ModServerConfig);
                         }
 
                         if (_possessionTimeSeconds.Count != 0) {
@@ -4357,7 +4928,7 @@ namespace oomtm450PuckMod_Stats {
                             foreach (string key in new List<string>(_possessionTimeSeconds.Keys))
                                 batchPossessionTime += key + ';' + _possessionTimeSeconds[key].ToString("F2") + ';';
                             batchPossessionTime = batchPossessionTime.Remove(batchPossessionTime.Length - 1);
-                            NetworkCommunication.SendData(BATCH_POSSESSION_TIME, batchPossessionTime, clientId, Constants.FROM_SERVER_TO_CLIENT, ServerConfig);
+                            NetworkCommunication.SendData(BATCH_POSSESSION_TIME, batchPossessionTime, clientId, Constants.FROM_SERVER_TO_CLIENT, ModServerConfig);
                         }
 
                         if (_puckBattleWins.Count != 0) {
@@ -4365,7 +4936,7 @@ namespace oomtm450PuckMod_Stats {
                             foreach (string key in new List<string>(_puckBattleWins.Keys))
                                 batchPuckBattleWins += key + ';' + _puckBattleWins[key].ToString() + ';';
                             batchPuckBattleWins = batchPuckBattleWins.Remove(batchPuckBattleWins.Length - 1);
-                            NetworkCommunication.SendData(BATCH_PUCK_BATTLE_WINS, batchPuckBattleWins, clientId, Constants.FROM_SERVER_TO_CLIENT, ServerConfig);
+                            NetworkCommunication.SendData(BATCH_PUCK_BATTLE_WINS, batchPuckBattleWins, clientId, Constants.FROM_SERVER_TO_CLIENT, ModServerConfig);
                         }
 
                         if (_puckBattleLosses.Count != 0) {
@@ -4373,7 +4944,7 @@ namespace oomtm450PuckMod_Stats {
                             foreach (string key in new List<string>(_puckBattleLosses.Keys))
                                 batchPuckBattleLosses += key + ';' + _puckBattleLosses[key].ToString() + ';';
                             batchPuckBattleLosses = batchPuckBattleLosses.Remove(batchPuckBattleLosses.Length - 1);
-                            NetworkCommunication.SendData(BATCH_PUCK_BATTLE_LOSSES, batchPuckBattleLosses, clientId, Constants.FROM_SERVER_TO_CLIENT, ServerConfig);
+                            NetworkCommunication.SendData(BATCH_PUCK_BATTLE_LOSSES, batchPuckBattleLosses, clientId, Constants.FROM_SERVER_TO_CLIENT, ModServerConfig);
                         }
 
                         if (_shotAttempts.Count != 0) {
@@ -4381,7 +4952,7 @@ namespace oomtm450PuckMod_Stats {
                             foreach (string key in new List<string>(_shotAttempts.Keys))
                                 batchShotAttempts += key + ';' + _shotAttempts[key].ToString() + ';';
                             batchShotAttempts = batchShotAttempts.Remove(batchShotAttempts.Length - 1);
-                            NetworkCommunication.SendData(BATCH_SHOT_ATTEMPTS, batchShotAttempts, clientId, Constants.FROM_SERVER_TO_CLIENT, ServerConfig);
+                            NetworkCommunication.SendData(BATCH_SHOT_ATTEMPTS, batchShotAttempts, clientId, Constants.FROM_SERVER_TO_CLIENT, ModServerConfig);
                         }
 
                         if (_homePlateSogs.Count != 0) {
@@ -4389,7 +4960,7 @@ namespace oomtm450PuckMod_Stats {
                             foreach (string key in new List<string>(_homePlateSogs.Keys))
                                 batchHomePlateSogs += key + ';' + _homePlateSogs[key].ToString() + ';';
                             batchHomePlateSogs = batchHomePlateSogs.Remove(batchHomePlateSogs.Length - 1);
-                            NetworkCommunication.SendData(BATCH_HOME_PLATE_SOGS, batchHomePlateSogs, clientId, Constants.FROM_SERVER_TO_CLIENT, ServerConfig);
+                            NetworkCommunication.SendData(BATCH_HOME_PLATE_SOGS, batchHomePlateSogs, clientId, Constants.FROM_SERVER_TO_CLIENT, ModServerConfig);
                         }
 
                         // Send team stats
@@ -4398,7 +4969,7 @@ namespace oomtm450PuckMod_Stats {
                             foreach (PlayerTeam team in new List<PlayerTeam>(_teamShots.Keys))
                                 batchTeamShots += team.ToString() + ';' + _teamShots[team].ToString() + ';';
                             batchTeamShots = batchTeamShots.Remove(batchTeamShots.Length - 1);
-                            NetworkCommunication.SendData(BATCH_TEAM_SHOTS, batchTeamShots, clientId, Constants.FROM_SERVER_TO_CLIENT, ServerConfig);
+                            NetworkCommunication.SendData(BATCH_TEAM_SHOTS, batchTeamShots, clientId, Constants.FROM_SERVER_TO_CLIENT, ModServerConfig);
                         }
 
                         if (_teamShotAttempts.Count != 0) {
@@ -4406,7 +4977,7 @@ namespace oomtm450PuckMod_Stats {
                             foreach (PlayerTeam team in new List<PlayerTeam>(_teamShotAttempts.Keys))
                                 batchTeamShotAttempts += team.ToString() + ';' + _teamShotAttempts[team].ToString() + ';';
                             batchTeamShotAttempts = batchTeamShotAttempts.Remove(batchTeamShotAttempts.Length - 1);
-                            NetworkCommunication.SendData(BATCH_TEAM_SHOT_ATTEMPTS, batchTeamShotAttempts, clientId, Constants.FROM_SERVER_TO_CLIENT, ServerConfig);
+                            NetworkCommunication.SendData(BATCH_TEAM_SHOT_ATTEMPTS, batchTeamShotAttempts, clientId, Constants.FROM_SERVER_TO_CLIENT, ModServerConfig);
                         }
 
                         if (_teamHomePlateSogs.Count != 0) {
@@ -4414,7 +4985,7 @@ namespace oomtm450PuckMod_Stats {
                             foreach (PlayerTeam team in new List<PlayerTeam>(_teamHomePlateSogs.Keys))
                                 batchTeamHomePlateSogs += team.ToString() + ';' + _teamHomePlateSogs[team].ToString() + ';';
                             batchTeamHomePlateSogs = batchTeamHomePlateSogs.Remove(batchTeamHomePlateSogs.Length - 1);
-                            NetworkCommunication.SendData(BATCH_TEAM_HOME_PLATE_SOGS, batchTeamHomePlateSogs, clientId, Constants.FROM_SERVER_TO_CLIENT, ServerConfig);
+                            NetworkCommunication.SendData(BATCH_TEAM_HOME_PLATE_SOGS, batchTeamHomePlateSogs, clientId, Constants.FROM_SERVER_TO_CLIENT, ModServerConfig);
                         }
 
                         if (_teamFaceoffWins.Count != 0) {
@@ -4422,7 +4993,7 @@ namespace oomtm450PuckMod_Stats {
                             foreach (PlayerTeam team in new List<PlayerTeam>(_teamFaceoffWins.Keys))
                                 batchTeamFaceoffWins += team.ToString() + ';' + _teamFaceoffWins[team].ToString() + ';';
                             batchTeamFaceoffWins = batchTeamFaceoffWins.Remove(batchTeamFaceoffWins.Length - 1);
-                            NetworkCommunication.SendData(BATCH_TEAM_FACEOFF_WINS, batchTeamFaceoffWins, clientId, Constants.FROM_SERVER_TO_CLIENT, ServerConfig);
+                            NetworkCommunication.SendData(BATCH_TEAM_FACEOFF_WINS, batchTeamFaceoffWins, clientId, Constants.FROM_SERVER_TO_CLIENT, ModServerConfig);
                         }
 
                         if (_teamFaceoffTotal.Count != 0) {
@@ -4430,7 +5001,7 @@ namespace oomtm450PuckMod_Stats {
                             foreach (PlayerTeam team in new List<PlayerTeam>(_teamFaceoffTotal.Keys))
                                 batchTeamFaceoffTotal += team.ToString() + ';' + _teamFaceoffTotal[team].ToString() + ';';
                             batchTeamFaceoffTotal = batchTeamFaceoffTotal.Remove(batchTeamFaceoffTotal.Length - 1);
-                            NetworkCommunication.SendData(BATCH_TEAM_FACEOFF_TOTAL, batchTeamFaceoffTotal, clientId, Constants.FROM_SERVER_TO_CLIENT, ServerConfig);
+                            NetworkCommunication.SendData(BATCH_TEAM_FACEOFF_TOTAL, batchTeamFaceoffTotal, clientId, Constants.FROM_SERVER_TO_CLIENT, ModServerConfig);
                         }
 
                         if (_teamTakeaways.Count != 0) {
@@ -4438,7 +5009,7 @@ namespace oomtm450PuckMod_Stats {
                             foreach (PlayerTeam team in new List<PlayerTeam>(_teamTakeaways.Keys))
                                 batchTeamTakeaways += team.ToString() + ';' + _teamTakeaways[team].ToString() + ';';
                             batchTeamTakeaways = batchTeamTakeaways.Remove(batchTeamTakeaways.Length - 1);
-                            NetworkCommunication.SendData(BATCH_TEAM_TAKEAWAYS, batchTeamTakeaways, clientId, Constants.FROM_SERVER_TO_CLIENT, ServerConfig);
+                            NetworkCommunication.SendData(BATCH_TEAM_TAKEAWAYS, batchTeamTakeaways, clientId, Constants.FROM_SERVER_TO_CLIENT, ModServerConfig);
                         }
 
                         if (_teamTurnovers.Count != 0) {
@@ -4446,7 +5017,7 @@ namespace oomtm450PuckMod_Stats {
                             foreach (PlayerTeam team in new List<PlayerTeam>(_teamTurnovers.Keys))
                                 batchTeamTurnovers += team.ToString() + ';' + _teamTurnovers[team].ToString() + ';';
                             batchTeamTurnovers = batchTeamTurnovers.Remove(batchTeamTurnovers.Length - 1);
-                            NetworkCommunication.SendData(BATCH_TEAM_TURNOVERS, batchTeamTurnovers, clientId, Constants.FROM_SERVER_TO_CLIENT, ServerConfig);
+                            NetworkCommunication.SendData(BATCH_TEAM_TURNOVERS, batchTeamTurnovers, clientId, Constants.FROM_SERVER_TO_CLIENT, ModServerConfig);
                         }
 
                         if (_teamExits.Count != 0) {
@@ -4454,7 +5025,7 @@ namespace oomtm450PuckMod_Stats {
                             foreach (PlayerTeam team in new List<PlayerTeam>(_teamExits.Keys))
                                 batchTeamExits += team.ToString() + ';' + _teamExits[team].ToString() + ';';
                             batchTeamExits = batchTeamExits.Remove(batchTeamExits.Length - 1);
-                            NetworkCommunication.SendData(BATCH_TEAM_EXITS, batchTeamExits, clientId, Constants.FROM_SERVER_TO_CLIENT, ServerConfig);
+                            NetworkCommunication.SendData(BATCH_TEAM_EXITS, batchTeamExits, clientId, Constants.FROM_SERVER_TO_CLIENT, ModServerConfig);
                         }
 
                         if (_teamEntries.Count != 0) {
@@ -4462,7 +5033,7 @@ namespace oomtm450PuckMod_Stats {
                             foreach (PlayerTeam team in new List<PlayerTeam>(_teamEntries.Keys))
                                 batchTeamEntries += team.ToString() + ';' + _teamEntries[team].ToString() + ';';
                             batchTeamEntries = batchTeamEntries.Remove(batchTeamEntries.Length - 1);
-                            NetworkCommunication.SendData(BATCH_TEAM_ENTRIES, batchTeamEntries, clientId, Constants.FROM_SERVER_TO_CLIENT, ServerConfig);
+                            NetworkCommunication.SendData(BATCH_TEAM_ENTRIES, batchTeamEntries, clientId, Constants.FROM_SERVER_TO_CLIENT, ModServerConfig);
                         }
 
                         if (_teamPasses.Count != 0) {
@@ -4470,7 +5041,7 @@ namespace oomtm450PuckMod_Stats {
                             foreach (PlayerTeam team in new List<PlayerTeam>(_teamPasses.Keys))
                                 batchTeamPasses += team.ToString() + ';' + _teamPasses[team].ToString() + ';';
                             batchTeamPasses = batchTeamPasses.Remove(batchTeamPasses.Length - 1);
-                            NetworkCommunication.SendData(BATCH_TEAM_PASSES, batchTeamPasses, clientId, Constants.FROM_SERVER_TO_CLIENT, ServerConfig);
+                            NetworkCommunication.SendData(BATCH_TEAM_PASSES, batchTeamPasses, clientId, Constants.FROM_SERVER_TO_CLIENT, ModServerConfig);
                         }
 
                         if (_teamPossessionTime.Count != 0) {
@@ -4478,7 +5049,7 @@ namespace oomtm450PuckMod_Stats {
                             foreach (PlayerTeam team in new List<PlayerTeam>(_teamPossessionTime.Keys))
                                 batchTeamPossessionTime += team.ToString() + ';' + _teamPossessionTime[team].ToString("F2") + ';';
                             batchTeamPossessionTime = batchTeamPossessionTime.Remove(batchTeamPossessionTime.Length - 1);
-                            NetworkCommunication.SendData(BATCH_TEAM_POSSESSION_TIME, batchTeamPossessionTime, clientId, Constants.FROM_SERVER_TO_CLIENT, ServerConfig);
+                            NetworkCommunication.SendData(BATCH_TEAM_POSSESSION_TIME, batchTeamPossessionTime, clientId, Constants.FROM_SERVER_TO_CLIENT, ModServerConfig);
                         }
 
                         if (_teamPuckBattleWins.Count != 0) {
@@ -4486,7 +5057,7 @@ namespace oomtm450PuckMod_Stats {
                             foreach (PlayerTeam team in new List<PlayerTeam>(_teamPuckBattleWins.Keys))
                                 batchTeamPuckBattleWins += team.ToString() + ';' + _teamPuckBattleWins[team].ToString() + ';';
                             batchTeamPuckBattleWins = batchTeamPuckBattleWins.Remove(batchTeamPuckBattleWins.Length - 1);
-                            NetworkCommunication.SendData(BATCH_TEAM_PUCK_BATTLE_WINS, batchTeamPuckBattleWins, clientId, Constants.FROM_SERVER_TO_CLIENT, ServerConfig);
+                            NetworkCommunication.SendData(BATCH_TEAM_PUCK_BATTLE_WINS, batchTeamPuckBattleWins, clientId, Constants.FROM_SERVER_TO_CLIENT, ModServerConfig);
                         }
 
                         if (_teamPuckBattleLosses.Count != 0) {
@@ -4494,7 +5065,7 @@ namespace oomtm450PuckMod_Stats {
                             foreach (PlayerTeam team in new List<PlayerTeam>(_teamPuckBattleLosses.Keys))
                                 batchTeamPuckBattleLosses += team.ToString() + ';' + _teamPuckBattleLosses[team].ToString() + ';';
                             batchTeamPuckBattleLosses = batchTeamPuckBattleLosses.Remove(batchTeamPuckBattleLosses.Length - 1);
-                            NetworkCommunication.SendData(BATCH_TEAM_PUCK_BATTLE_LOSSES, batchTeamPuckBattleLosses, clientId, Constants.FROM_SERVER_TO_CLIENT, ServerConfig);
+                            NetworkCommunication.SendData(BATCH_TEAM_PUCK_BATTLE_LOSSES, batchTeamPuckBattleLosses, clientId, Constants.FROM_SERVER_TO_CLIENT, ModServerConfig);
                         }
 
                         // Send stick saves
@@ -4503,7 +5074,7 @@ namespace oomtm450PuckMod_Stats {
                             foreach (string key in new List<string>(_stickSaves.Keys))
                                 batchStickSaves += key + ';' + _stickSaves[key].ToString() + ';';
                             batchStickSaves = batchStickSaves.Remove(batchStickSaves.Length - 1);
-                            NetworkCommunication.SendData(BATCH_STICK_SAVES, batchStickSaves, clientId, Constants.FROM_SERVER_TO_CLIENT, ServerConfig);
+                            NetworkCommunication.SendData(BATCH_STICK_SAVES, batchStickSaves, clientId, Constants.FROM_SERVER_TO_CLIENT, ModServerConfig);
                         }
 
                         // Send body saves
@@ -4512,7 +5083,7 @@ namespace oomtm450PuckMod_Stats {
                             foreach (string key in new List<string>(_bodySaves.Keys))
                                 batchBodySaves += key + ';' + _bodySaves[key].ToString() + ';';
                             batchBodySaves = batchBodySaves.Remove(batchBodySaves.Length - 1);
-                            NetworkCommunication.SendData(BATCH_BODY_SAVES, batchBodySaves, clientId, Constants.FROM_SERVER_TO_CLIENT, ServerConfig);
+                            NetworkCommunication.SendData(BATCH_BODY_SAVES, batchBodySaves, clientId, Constants.FROM_SERVER_TO_CLIENT, ModServerConfig);
                         }
 
                         // Send home plate saves
@@ -4521,7 +5092,7 @@ namespace oomtm450PuckMod_Stats {
                             foreach (string key in new List<string>(_homePlateSaves.Keys))
                                 batchHomePlateSaves += key + ';' + _homePlateSaves[key].ToString() + ';';
                             batchHomePlateSaves = batchHomePlateSaves.Remove(batchHomePlateSaves.Length - 1);
-                            NetworkCommunication.SendData(BATCH_HOME_PLATE_SAVES, batchHomePlateSaves, clientId, Constants.FROM_SERVER_TO_CLIENT, ServerConfig);
+                            NetworkCommunication.SendData(BATCH_HOME_PLATE_SAVES, batchHomePlateSaves, clientId, Constants.FROM_SERVER_TO_CLIENT, ModServerConfig);
                         }
 
                         // Send home plate shots faced
@@ -4530,11 +5101,11 @@ namespace oomtm450PuckMod_Stats {
                             foreach (string key in new List<string>(_homePlateShots.Keys))
                                 batchHomePlateShots += key + ';' + _homePlateShots[key].ToString() + ';';
                             batchHomePlateShots = batchHomePlateShots.Remove(batchHomePlateShots.Length - 1);
-                            NetworkCommunication.SendData(BATCH_HOME_PLATE_SHOTS_FACED, batchHomePlateShots, clientId, Constants.FROM_SERVER_TO_CLIENT, ServerConfig);
+                            NetworkCommunication.SendData(BATCH_HOME_PLATE_SHOTS_FACED, batchHomePlateShots, clientId, Constants.FROM_SERVER_TO_CLIENT, ModServerConfig);
                         }
 
                         foreach (int key in new List<int>(_stars.Keys))
-                            NetworkCommunication.SendData(STAR, $"{_stars[key]};{key}", clientId, Constants.FROM_SERVER_TO_CLIENT, ServerConfig);
+                            NetworkCommunication.SendData(STAR, $"{_stars[key]};{key}", clientId, Constants.FROM_SERVER_TO_CLIENT, ModServerConfig);
                         break;
 
                     /*case RESET_SOG:
@@ -4574,6 +5145,7 @@ namespace oomtm450PuckMod_Stats {
                         Client_ResetHomePlateSaves();
                         Client_ResetHomePlateShots();
                         Client_ResetTeamStats();
+                        Client_RefreshTooltipsAndLabelsAfterReset();
                         break;
 
                     case BATCH_SOG:
@@ -4942,7 +5514,32 @@ namespace oomtm450PuckMod_Stats {
                         break;
 
                     default:
-                        if (dataName.StartsWith(Codebase.Constants.SOG)) {
+                        // Fallback: handle corrupted RESET_ALL when normalization missed it
+                        bool fromServer = clientId == NetworkManager.ServerClientId;
+                        bool shortPayload = dataStr != null && dataStr.Length <= 4 && !dataStr.Contains(';');
+                        if (fromServer && shortPayload && dataName != null && dataName.StartsWith(Constants.MOD_NAME)) {
+                            Client_ResetSOG();
+                            Client_ResetSavePerc();
+                            Client_ResetPasses();
+                            Client_ResetBlocks();
+                            Client_ResetHits();
+                            Client_ResetTakeaways();
+                            Client_ResetTurnovers();
+                            Client_ResetExits();
+                            Client_ResetEntries();
+                            Client_ResetShotAttempts();
+                            Client_ResetHomePlateSogs();
+                            Client_ResetPuckTouches();
+                            Client_ResetPossessionTime();
+                            Client_ResetPuckBattles();
+                            Client_ResetStickSaves();
+                            Client_ResetBodySaves();
+                            Client_ResetHomePlateSaves();
+                            Client_ResetHomePlateShots();
+                            Client_ResetTeamStats();
+                            Client_RefreshTooltipsAndLabelsAfterReset();
+                        }
+                        else if (dataName.StartsWith(Codebase.Constants.SOG)) {
                             string playerSteamId = dataName.Replace(Codebase.Constants.SOG, "");
                             if (string.IsNullOrEmpty(playerSteamId))
                                 return;
@@ -5192,7 +5789,7 @@ namespace oomtm450PuckMod_Stats {
                 }
             }
             catch (Exception ex) {
-                Logging.LogError($"Error in ReceiveData.\n{ex}", ServerConfig);
+                Logging.LogError($"Error in ReceiveData.\n{ex}", ModServerConfig);
             }
         }
 
@@ -5207,20 +5804,6 @@ namespace oomtm450PuckMod_Stats {
             }
             else
                 _sog.Add(playerSteamId, sog);
-
-            // Write to client-side file.
-            if (_clientConfig.LogClientSideStats) {
-                StringBuilder csvContent = new StringBuilder();
-                foreach (var kvp in _sog) {
-                    Player player = PlayerManager.Instance.GetPlayerBySteamId(kvp.Key);
-                    if (!player || PlayerFunc.IsGoalie(player))
-                        continue;
-
-                    csvContent.AppendLine($"{player.Username.Value};{player.Number.Value};{player.Team.Value};{kvp.Key};{kvp.Value}");
-                }
-
-                File.WriteAllText(Path.Combine(Path.GetFullPath("."), Constants.MOD_NAME + "_shots.csv"), csvContent.ToString());
-            }
         }
 
         private static void ReceiveData_SavePerc(string playerSteamId, string dataStr) {
@@ -5236,19 +5819,6 @@ namespace oomtm450PuckMod_Stats {
             }
             else
                 _savePerc.Add(playerSteamId, (saves, shots));
-
-            // Write to client-side file.
-            if (_clientConfig.LogClientSideStats) {
-                StringBuilder csvContent = new StringBuilder();
-                foreach (var kvp in _savePerc) {
-                    Player player = PlayerManager.Instance.GetPlayerBySteamId(kvp.Key);
-                    if (!player || !PlayerFunc.IsGoalie(player))
-                        continue;
-                    csvContent.AppendLine($"{player.Username.Value};{player.Number.Value};{player.Team.Value};{kvp.Key};{kvp.Value.Saves};{kvp.Value.Shots}");
-                }
-
-                File.WriteAllText(Path.Combine(Path.GetFullPath("."), Constants.MOD_NAME + "_saves.csv"), csvContent.ToString());
-            }
         }
 
         private static void ReceiveData_Star(string playerSteamId, string dataStr) {
@@ -5405,6 +5975,7 @@ namespace oomtm450PuckMod_Stats {
             } else {
                 _teamShots.Add(team, shots);
             }
+            WriteClientTeamStatsToFile();
         }
 
         private static void ReceiveData_TeamShotAttempts(PlayerTeam team, string dataStr) {
@@ -5413,6 +5984,7 @@ namespace oomtm450PuckMod_Stats {
                 _teamShotAttempts[team] = attempts;
             else
                 _teamShotAttempts.Add(team, attempts);
+            WriteClientTeamStatsToFile();
         }
 
 
@@ -5422,6 +5994,7 @@ namespace oomtm450PuckMod_Stats {
                 _teamHomePlateSogs[team] = homePlateSog;
             else
                 _teamHomePlateSogs.Add(team, homePlateSog);
+            WriteClientTeamStatsToFile();
         }
 
         private static void ReceiveData_TeamPasses(PlayerTeam team, string dataStr) {
@@ -5431,6 +6004,7 @@ namespace oomtm450PuckMod_Stats {
             } else {
                 _teamPasses.Add(team, passes);
             }
+            WriteClientTeamStatsToFile();
         }
 
         private static void ReceiveData_TeamFaceoffWins(PlayerTeam team, string dataStr) {
@@ -5440,6 +6014,7 @@ namespace oomtm450PuckMod_Stats {
             } else {
                 _teamFaceoffWins.Add(team, wins);
             }
+            WriteClientTeamStatsToFile();
         }
 
         private static void ReceiveData_TeamFaceoffTotal(PlayerTeam team, string dataStr) {
@@ -5449,6 +6024,7 @@ namespace oomtm450PuckMod_Stats {
             } else {
                 _teamFaceoffTotal.Add(team, total);
             }
+            WriteClientTeamStatsToFile();
         }
 
         private static void ReceiveData_TeamTakeaways(PlayerTeam team, string dataStr) {
@@ -5458,6 +6034,7 @@ namespace oomtm450PuckMod_Stats {
             } else {
                 _teamTakeaways.Add(team, takeaways);
             }
+            WriteClientTeamStatsToFile();
         }
 
         private static void ReceiveData_TeamTurnovers(PlayerTeam team, string dataStr) {
@@ -5467,6 +6044,7 @@ namespace oomtm450PuckMod_Stats {
             } else {
                 _teamTurnovers.Add(team, turnovers);
             }
+            WriteClientTeamStatsToFile();
         }
 
         private static void ReceiveData_TeamExits(PlayerTeam team, string dataStr) {
@@ -5476,6 +6054,7 @@ namespace oomtm450PuckMod_Stats {
             } else {
                 _teamExits.Add(team, exits);
             }
+            WriteClientTeamStatsToFile();
         }
 
         private static void ReceiveData_TeamEntries(PlayerTeam team, string dataStr) {
@@ -5485,6 +6064,7 @@ namespace oomtm450PuckMod_Stats {
             } else {
                 _teamEntries.Add(team, entries);
             }
+            WriteClientTeamStatsToFile();
         }
 
         private static void ReceiveData_TeamPossessionTime(PlayerTeam team, string dataStr) {
@@ -5494,6 +6074,7 @@ namespace oomtm450PuckMod_Stats {
             } else {
                 _teamPossessionTime.Add(team, possessionTime);
             }
+            WriteClientTeamStatsToFile();
         }
 
         private static void ReceiveData_TeamPuckBattleWins(PlayerTeam team, string dataStr) {
@@ -5503,6 +6084,7 @@ namespace oomtm450PuckMod_Stats {
             } else {
                 _teamPuckBattleWins.Add(team, wins);
             }
+            WriteClientTeamStatsToFile();
         }
 
         private static void ReceiveData_TeamPuckBattleLosses(PlayerTeam team, string dataStr) {
@@ -5511,6 +6093,93 @@ namespace oomtm450PuckMod_Stats {
                 _teamPuckBattleLosses[team] = losses;
             } else {
                 _teamPuckBattleLosses.Add(team, losses);
+            }
+            WriteClientTeamStatsToFile();
+        }
+
+        /// <summary>
+        /// Writes all team-level stats to a single client-side CSV when LogClientSideStats is enabled.
+        /// Includes goals (from game score) and saves (sum of goalie saves per team).
+        /// </summary>
+        private static void WriteClientTeamStatsToFile() {
+            if (!_clientConfig.LogClientSideStats)
+                return;
+            try {
+                int blueGoals = 0, redGoals = 0;
+                if (GameManager.Instance != null) {
+                    blueGoals = GameManager.Instance.BlueScore;
+                    redGoals = GameManager.Instance.RedScore;
+                }
+                // Sum saves from all positions (so pulled goalie / backup goalie / skater saves count)
+                int blueSaves = 0, redSaves = 0;
+                if (PlayerManager.Instance != null) {
+                    foreach (Player p in PlayerManager.Instance.GetPlayers()) {
+                        if (p == null || !p)
+                            continue;
+                        string steamId = p.SteamId.Value.Value;
+                        if (!_savePerc.TryGetValue(steamId, out var sp))
+                            continue;
+                        if (p.Team == PlayerTeam.Blue)
+                            blueSaves += sp.Saves;
+                        else if (p.Team == PlayerTeam.Red)
+                            redSaves += sp.Saves;
+                    }
+                }
+                string statsFolderPath = Path.Combine(Path.GetFullPath("."), "stats");
+                if (!Directory.Exists(statsFolderPath))
+                    Directory.CreateDirectory(statsFolderPath);
+                int blueShots = _teamShots.TryGetValue(PlayerTeam.Blue, out int bs) ? bs : 0;
+                int redShots = _teamShots.TryGetValue(PlayerTeam.Red, out int rs) ? rs : 0;
+                int bluePasses = _teamPasses.TryGetValue(PlayerTeam.Blue, out int bp) ? bp : 0;
+                int redPasses = _teamPasses.TryGetValue(PlayerTeam.Red, out int rp) ? rp : 0;
+                int blueFaceoffWins = _teamFaceoffWins.TryGetValue(PlayerTeam.Blue, out int bfw) ? bfw : 0;
+                int redFaceoffWins = _teamFaceoffWins.TryGetValue(PlayerTeam.Red, out int rfw) ? rfw : 0;
+                int blueExits = _teamExits.TryGetValue(PlayerTeam.Blue, out int be) ? be : 0;
+                int redExits = _teamExits.TryGetValue(PlayerTeam.Red, out int re) ? re : 0;
+                int blueEntries = _teamEntries.TryGetValue(PlayerTeam.Blue, out int ben) ? ben : 0;
+                int redEntries = _teamEntries.TryGetValue(PlayerTeam.Red, out int ren) ? ren : 0;
+                double bluePossession = _teamPossessionTime.TryGetValue(PlayerTeam.Blue, out double bpt) ? bpt : 0;
+                double redPossession = _teamPossessionTime.TryGetValue(PlayerTeam.Red, out double rpt) ? rpt : 0;
+                string path = Path.Combine(statsFolderPath, "PHL_stats_team.csv");
+                var sb = new StringBuilder();
+                sb.AppendLine("team,shots,shotAttempts,homePlateSogs,passes,faceoffWins,faceoffTotal,takeaways,turnovers,exits,entries,possessionTime,puckBattleWins,puckBattleLosses,goals,saves");
+                foreach (PlayerTeam team in new[] { PlayerTeam.Blue, PlayerTeam.Red }) {
+                    int shots = team == PlayerTeam.Blue ? blueShots : redShots;
+                    int shotAttempts = _teamShotAttempts.TryGetValue(team, out int sa) ? sa : 0;
+                    int homePlateSogs = _teamHomePlateSogs.TryGetValue(team, out int hps) ? hps : 0;
+                    int passes = team == PlayerTeam.Blue ? bluePasses : redPasses;
+                    int faceoffWins = team == PlayerTeam.Blue ? blueFaceoffWins : redFaceoffWins;
+                    int faceoffTotal = _teamFaceoffTotal.TryGetValue(team, out int ft) ? ft : 0;
+                    int takeaways = _teamTakeaways.TryGetValue(team, out int tk) ? tk : 0;
+                    int turnovers = _teamTurnovers.TryGetValue(team, out int to) ? to : 0;
+                    int exits = team == PlayerTeam.Blue ? blueExits : redExits;
+                    int entries = team == PlayerTeam.Blue ? blueEntries : redEntries;
+                    double possessionTime = team == PlayerTeam.Blue ? bluePossession : redPossession;
+                    int puckBattleWins = _teamPuckBattleWins.TryGetValue(team, out int pbw) ? pbw : 0;
+                    int puckBattleLosses = _teamPuckBattleLosses.TryGetValue(team, out int pbl) ? pbl : 0;
+                    int goals = team == PlayerTeam.Blue ? blueGoals : redGoals;
+                    int saves = team == PlayerTeam.Blue ? blueSaves : redSaves;
+                    sb.AppendLine($"{team},{shots},{shotAttempts},{homePlateSogs},{passes},{faceoffWins},{faceoffTotal},{takeaways},{turnovers},{exits},{entries},{possessionTime.ToString("R", CultureInfo.InvariantCulture)},{puckBattleWins},{puckBattleLosses},{goals},{saves}");
+                }
+                File.WriteAllText(path, sb.ToString());
+                // Individual text files per stat per team for OBS/overlays
+                File.WriteAllText(Path.Combine(statsFolderPath, "bluegoals.txt"), blueGoals.ToString());
+                File.WriteAllText(Path.Combine(statsFolderPath, "redgoals.txt"), redGoals.ToString());
+                File.WriteAllText(Path.Combine(statsFolderPath, "blueshots.txt"), blueShots.ToString());
+                File.WriteAllText(Path.Combine(statsFolderPath, "redshots.txt"), redShots.ToString());
+                File.WriteAllText(Path.Combine(statsFolderPath, "bluefaceoffwins.txt"), blueFaceoffWins.ToString());
+                File.WriteAllText(Path.Combine(statsFolderPath, "redfaceoffwins.txt"), redFaceoffWins.ToString());
+                File.WriteAllText(Path.Combine(statsFolderPath, "blueexits.txt"), blueExits.ToString());
+                File.WriteAllText(Path.Combine(statsFolderPath, "redexits.txt"), redExits.ToString());
+                File.WriteAllText(Path.Combine(statsFolderPath, "blueentries.txt"), blueEntries.ToString());
+                File.WriteAllText(Path.Combine(statsFolderPath, "redentries.txt"), redEntries.ToString());
+                File.WriteAllText(Path.Combine(statsFolderPath, "bluepossession.txt"), bluePossession.ToString("R", CultureInfo.InvariantCulture));
+                File.WriteAllText(Path.Combine(statsFolderPath, "redpossession.txt"), redPossession.ToString("R", CultureInfo.InvariantCulture));
+                File.WriteAllText(Path.Combine(statsFolderPath, "bluepasses.txt"), bluePasses.ToString());
+                File.WriteAllText(Path.Combine(statsFolderPath, "redpasses.txt"), redPasses.ToString());
+            }
+            catch (Exception ex) {
+                Logging.LogError($"Error writing client team stats file: {ex}", _clientConfig);
             }
         }
 
@@ -5550,296 +6219,393 @@ namespace oomtm450PuckMod_Stats {
             }
         }
 
+        private static EventCallback<GeometryChangedEvent> _columnLayoutGeometryCallback;
+
+        private static void HideAllPlayerTooltips() {
+            foreach (var kvp in new List<KeyValuePair<string, VisualElement>>(_playerTooltips)) {
+                if (kvp.Value != null)
+                    kvp.Value.style.display = DisplayStyle.None;
+            }
+            foreach (var kvp in new List<KeyValuePair<PlayerTeam, VisualElement>>(_teamTooltips)) {
+                if (kvp.Value != null)
+                    kvp.Value.style.display = DisplayStyle.None;
+            }
+        }
+
+        private static void UnregisterPlayerTooltipPointerHandlers(string playerSteamId) {
+            if (!_playerTooltipPointerHandlers.TryGetValue(playerSteamId, out PlayerTooltipPointerHandlers handlers))
+                return;
+            if (_playerTooltipContainers.TryGetValue(playerSteamId, out VisualElement container) && container != null) {
+                if (handlers.Enter != null)
+                    container.UnregisterCallback(handlers.Enter);
+                if (handlers.Leave != null)
+                    container.UnregisterCallback(handlers.Leave);
+            }
+            _playerTooltipPointerHandlers.Remove(playerSteamId);
+        }
+
+        private static void UnregisterScoreboardColumnSync() {
+            if (_sogColHeaderRow != null && _columnLayoutGeometryCallback != null)
+                _sogColHeaderRow.UnregisterCallback(_columnLayoutGeometryCallback);
+            _scoreboardColumnSyncRegistered = false;
+            _sogColHeaderRow = null;
+            _columnLayoutGeometryCallback = null;
+        }
+
+        private static float ResolveGoalsColumnWidth(VisualElement colHeaderRow, VisualElement playerContainer = null) {
+            float w = colHeaderRow?.Q("Goals")?.resolvedStyle.width ?? 0;
+            if (w <= 1) {
+                Label goalsHdrL = colHeaderRow?.Q<Label>("GoalsLabel");
+                if (goalsHdrL != null)
+                    w = goalsHdrL.resolvedStyle.width;
+            }
+            if (w <= 1 && playerContainer != null) {
+                w = playerContainer.Q("Goals")?.resolvedStyle.width ?? 0;
+                if (w <= 1) {
+                    Label goalsRowL = playerContainer.Q<Label>("GoalsLabel");
+                    if (goalsRowL != null)
+                        w = goalsRowL.resolvedStyle.width;
+                }
+            }
+            return w > 1 ? Mathf.Max(w, SOG_COLUMN_MIN_WIDTH) : 0;
+        }
+
+        private static void MirrorStatCellLayout(VisualElement targetCell, Label targetLabel, VisualElement refGoalsCell, Label refGoalsLabel, float width) {
+            if (targetCell == null)
+                return;
+            targetCell.style.width = width;
+            targetCell.style.minWidth = width;
+            targetCell.style.maxWidth = width;
+            if (refGoalsCell != null) {
+                targetCell.style.flexGrow = refGoalsCell.style.flexGrow;
+                targetCell.style.flexShrink = refGoalsCell.style.flexShrink;
+                targetCell.style.flexBasis = refGoalsCell.style.flexBasis;
+                targetCell.style.alignItems = refGoalsCell.style.alignItems;
+                targetCell.style.justifyContent = refGoalsCell.style.justifyContent;
+            }
+            if (targetLabel != null && refGoalsLabel != null) {
+                if (refGoalsLabel.resolvedStyle.fontSize > 0)
+                    targetLabel.style.fontSize = refGoalsLabel.resolvedStyle.fontSize;
+                // Color is synced on hover via pointer callbacks + StylePlayer — not here, or stale
+                // GoalsLabel colors from geometry/layout passes cause multi-second hover lag.
+                targetLabel.style.unityTextAlign = TextAnchor.MiddleCenter;
+            }
+        }
+
+        private static void SyncSogColumnLayout(VisualElement scoreboardContainer) {
+            if (scoreboardContainer == null)
+                return;
+            VisualElement colHeaderRow = _sogColHeaderRow ?? scoreboardContainer.Q("Content")?.Q("Header");
+            if (colHeaderRow == null)
+                return;
+
+            float w = ResolveGoalsColumnWidth(colHeaderRow);
+            if (w <= 1)
+                return;
+
+            VisualElement refGoalsHdrCell = colHeaderRow.Q("Goals");
+            Label refGoalsHdrLabel = colHeaderRow.Q<Label>("GoalsLabel");
+            VisualElement hdrCell = colHeaderRow.Q(SOG_CELL_NAME + "_ColHdr");
+            Label hdrLabel = colHeaderRow.Q<Label>(SOG_HEADER_LABEL_NAME);
+            if (hdrCell != null)
+                MirrorStatCellLayout(hdrCell, hdrLabel, refGoalsHdrCell, refGoalsHdrLabel, w);
+
+            var playerMap = SystemFunc.GetPrivateField<Dictionary<Player, VisualElement>>(
+                typeof(UIScoreboard), MonoBehaviourSingleton<UIManager>.Instance.Scoreboard, "playerVisualElementMap");
+            if (playerMap == null)
+                return;
+
+            foreach (var kvp in playerMap) {
+                VisualElement playerContainer = kvp.Value?.Q("Player");
+                if (playerContainer == null)
+                    continue;
+                VisualElement sogCell = playerContainer.Q(SOG_CELL_NAME);
+                if (sogCell == null)
+                    continue;
+                VisualElement refGoalsCell = playerContainer.Q("Goals");
+                Label refGoalsLabel = playerContainer.Q<Label>("GoalsLabel");
+                Label sogLabel = sogCell.Q<Label>(SOG_LABEL);
+                MirrorStatCellLayout(sogCell, sogLabel, refGoalsCell, refGoalsLabel, w);
+            }
+        }
+
+        private static void RegisterScoreboardColumnSync(VisualElement scoreboardContainer) {
+            if (_scoreboardColumnSyncRegistered || scoreboardContainer == null)
+                return;
+            VisualElement colHeaderRow = scoreboardContainer.Q("Content")?.Q("Header");
+            if (colHeaderRow == null)
+                return;
+            _sogColHeaderRow = colHeaderRow;
+            _columnLayoutGeometryCallback = _ => SyncSogColumnLayout(scoreboardContainer);
+            colHeaderRow.RegisterCallback(_columnLayoutGeometryCallback);
+            _scoreboardColumnSyncRegistered = true;
+            colHeaderRow.schedule.Execute(() => SyncSogColumnLayout(scoreboardContainer)).ExecuteLater(50);
+        }
+
+        private static Label FindPlayerNameLabel(VisualElement playerContainer, Player player) {
+            if (playerContainer == null)
+                return null;
+            foreach (VisualElement child in playerContainer.Children()) {
+                if (child is Label label) {
+                    string childName = label.name?.ToLower() ?? "";
+                    if (childName.Contains("username") || childName.Contains("name") || childName == "usernamelabel" || childName == "namelabel")
+                        return label;
+                }
+            }
+            try {
+                var queryResult = playerContainer.Query<Label>("UsernameLabel");
+                if (queryResult != null)
+                    return queryResult.First();
+            } catch { }
+            foreach (var label in playerContainer.Query<Label>().ToList()) {
+                if (label.text != null && player != null && player && label.text.Contains(player.Username.Value.Value))
+                    return label;
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// Keeps the custom S/Sv column text color in sync with GoalsLabel.
+        /// </summary>
+        private static void SyncSogLabelColorForContainer(VisualElement playerContainer) {
+            if (playerContainer == null)
+                return;
+            Label goalsL = playerContainer.Q<Label>("GoalsLabel");
+            Label sogL = playerContainer.Q<Label>(SOG_LABEL);
+            if (goalsL != null && sogL != null && goalsL.resolvedStyle.color.a > 0)
+                sogL.style.color = goalsL.resolvedStyle.color;
+        }
+
+        private static void ScheduleSogLabelColorSync(VisualElement scheduleOn, VisualElement playerContainer) {
+            if (scheduleOn == null || playerContainer == null)
+                return;
+            // Same-frame tail — after USS applies hover styles to GoalsLabel.
+            scheduleOn.schedule.Execute(() => SyncSogLabelColorForContainer(playerContainer)).ExecuteLater(0);
+        }
+
+        private static void RegisterSogHoverColorSync(VisualElement hoverTarget, VisualElement playerContainer, string playerSteamId) {
+            if (hoverTarget == null || playerContainer == null || _sogHoverCallbacksRegistered.Contains(playerSteamId))
+                return;
+            hoverTarget.RegisterCallback<PointerEnterEvent>(_ => ScheduleSogLabelColorSync(hoverTarget, playerContainer));
+            hoverTarget.RegisterCallback<PointerLeaveEvent>(_ => ScheduleSogLabelColorSync(hoverTarget, playerContainer));
+            _sogHoverCallbacksRegistered.Add(playerSteamId);
+        }
+
+        private static void EnsureScoreboardColumnInfrastructure(VisualElement scoreboardContainer, VisualElement headerRow) {
+            if (scoreboardContainer == null)
+                return;
+
+            if (!_hasUpdatedUIScoreboard.Contains("header")) {
+                if (headerRow != null) {
+                    VisualElement staleHeader = headerRow.Children().FirstOrDefault(x => x.name == SOG_HEADER_LABEL_NAME);
+                    if (staleHeader != null)
+                        headerRow.Remove(staleHeader);
+                }
+                _hasUpdatedUIScoreboard.Add("header");
+            }
+
+            if (!_hasUpdatedUIScoreboard.Contains("colHeader")) {
+                VisualElement colHeaderRow = scoreboardContainer.Q("Content")?.Q("Header");
+                if (colHeaderRow != null) {
+                    VisualElement staleColHdr = colHeaderRow.Children().FirstOrDefault(x => x.name == SOG_CELL_NAME + "_ColHdr");
+                    if (staleColHdr != null)
+                        colHeaderRow.Remove(staleColHdr);
+
+                    VisualElement sogHdrCell = new VisualElement { name = SOG_CELL_NAME + "_ColHdr" };
+                    sogHdrCell.pickingMode = PickingMode.Ignore;
+                    Label sogHdrLabel = new Label("S/Sv") { name = SOG_HEADER_LABEL_NAME };
+                    sogHdrLabel.pickingMode = PickingMode.Ignore;
+                    sogHdrLabel.style.unityTextAlign = TextAnchor.MiddleCenter;
+                    sogHdrCell.Add(sogHdrLabel);
+
+                    VisualElement pingHdr = colHeaderRow.Q("Ping");
+                    VisualElement goalsHdr = colHeaderRow.Q("Goals");
+                    VisualElement hdrAnchor = pingHdr ?? goalsHdr;
+                    if (hdrAnchor != null)
+                        colHeaderRow.Insert(colHeaderRow.IndexOf(hdrAnchor), sogHdrCell);
+                    else
+                        colHeaderRow.Add(sogHdrCell);
+
+                    _hasUpdatedUIScoreboard.Add("colHeader");
+                }
+            }
+
+            RegisterScoreboardColumnSync(scoreboardContainer);
+        }
+
+        private static void EnsurePlayerScoreboardRow(Player player, VisualElement rowElement, VisualElement scoreboardContainer) {
+            if (player == null || !player || rowElement == null || scoreboardContainer == null)
+                return;
+
+            string playerSteamId = player.SteamId.Value.Value;
+            if (string.IsNullOrEmpty(playerSteamId))
+                return;
+
+            VisualElement playerContainer = rowElement.Q("Player");
+            if (playerContainer == null)
+                return;
+
+            bool isGoalie = GetPlayerPosition(player) == "G";
+            bool sogExists = playerContainer.Q(SOG_CELL_NAME) != null || playerContainer.Children().Any(x => x.name == SOG_LABEL);
+
+            if (!sogExists && !_hasUpdatedUIScoreboard.Contains(playerSteamId)) {
+                VisualElement existingSogCell = playerContainer.Children().FirstOrDefault(x => x.name == SOG_CELL_NAME);
+                if (existingSogCell != null)
+                    playerContainer.Remove(existingSogCell);
+                VisualElement existingSogLabel = playerContainer.Children().FirstOrDefault(x => x.name == SOG_LABEL);
+                if (existingSogLabel != null)
+                    playerContainer.Remove(existingSogLabel);
+
+                VisualElement sogCell = new VisualElement { name = SOG_CELL_NAME };
+                sogCell.pickingMode = PickingMode.Ignore;
+                Label sogLabel = new Label(isGoalie ? GetGoalieSavePerc(0, 0) : "0") { name = SOG_LABEL };
+                sogLabel.pickingMode = PickingMode.Ignore;
+                sogLabel.style.unityTextAlign = TextAnchor.MiddleCenter;
+                sogCell.Add(sogLabel);
+
+                VisualElement pingLabel = playerContainer.Children().FirstOrDefault(x => x.name == "Ping");
+                VisualElement goalsAnchor = playerContainer.Children().FirstOrDefault(x => x.name == "Goals");
+                VisualElement anchor = pingLabel ?? goalsAnchor;
+                if (anchor != null)
+                    playerContainer.Insert(playerContainer.IndexOf(anchor), sogCell);
+                else
+                    playerContainer.Add(sogCell);
+
+                _sogLabels[playerSteamId] = sogLabel;
+
+                if (!_sog.TryGetValue(playerSteamId, out int _))
+                    _sog.Add(playerSteamId, 0);
+
+                _hasUpdatedUIScoreboard.Add(playerSteamId);
+            } else if (_sogLabels.TryGetValue(playerSteamId, out Label existingLabel) && existingLabel != null) {
+                bool wasGoalie = _playerTooltipIsGoalie.TryGetValue(playerSteamId, out bool wg) && wg;
+                if (wasGoalie != isGoalie) {
+                    if (isGoalie && _savePerc.TryGetValue(playerSteamId, out (int saves, int shots) sp))
+                        existingLabel.text = GetGoalieSavePerc(sp.saves, sp.shots);
+                    else if (isGoalie)
+                        existingLabel.text = GetGoalieSavePerc(0, 0);
+                    else
+                        existingLabel.text = _sog.TryGetValue(playerSteamId, out int sogVal) ? sogVal.ToString() : "0";
+                }
+            }
+
+            if (!_savePerc.TryGetValue(playerSteamId, out (int, int) _))
+                _savePerc.Add(playerSteamId, (0, 0));
+            if (!_hits.TryGetValue(playerSteamId, out int _))
+                _hits.Add(playerSteamId, 0);
+            if (!_turnovers.TryGetValue(playerSteamId, out int _))
+                _turnovers.Add(playerSteamId, 0);
+            if (!_takeaways.TryGetValue(playerSteamId, out int _))
+                _takeaways.Add(playerSteamId, 0);
+            if (!_passes.TryGetValue(playerSteamId, out int _))
+                _passes.Add(playerSteamId, 0);
+
+            if (_serverHasResponded) {
+                Label nameLabel = FindPlayerNameLabel(playerContainer, player);
+                if (nameLabel != null) {
+                    nameLabel.pickingMode = PickingMode.Position;
+                    playerContainer.pickingMode = PickingMode.Position;
+                    bool needsTooltip = !_playerTooltips.ContainsKey(playerSteamId);
+                    bool roleChanged = _playerTooltipIsGoalie.TryGetValue(playerSteamId, out bool wasGoalieRole) && wasGoalieRole != isGoalie;
+                    if (needsTooltip || roleChanged)
+                        SetupPlayerTooltip(nameLabel, playerContainer, playerSteamId, player, nameLabel);
+                }
+            }
+
+            RegisterSogHoverColorSync(rowElement, playerContainer, playerSteamId);
+        }
+
+        private static void RemovePlayerScoreboardRow(string playerSteamId, VisualElement rowElement) {
+            VisualElement playerContainer = rowElement?.Q("Player");
+            if (playerContainer != null) {
+                VisualElement sogCell = playerContainer.Q(SOG_CELL_NAME);
+                if (sogCell != null)
+                    playerContainer.Remove(sogCell);
+                VisualElement legacyLabel = playerContainer.Children().FirstOrDefault(x => x.name == SOG_LABEL);
+                if (legacyLabel != null)
+                    playerContainer.Remove(legacyLabel);
+            }
+            UnregisterPlayerTooltipPointerHandlers(playerSteamId);
+            _sogHoverCallbacksRegistered.Remove(playerSteamId);
+            if (_playerTooltips.TryGetValue(playerSteamId, out VisualElement tooltip)) {
+                tooltip.parent?.Remove(tooltip);
+                _playerTooltips.Remove(playerSteamId);
+            }
+            _playerTooltipNameLabels.Remove(playerSteamId);
+            _playerTooltipContainers.Remove(playerSteamId);
+            _playerTooltipIsGoalie.Remove(playerSteamId);
+            _sogLabels.Remove(playerSteamId);
+            _hasUpdatedUIScoreboard.Remove(playerSteamId);
+        }
+
+        private static void OnClientStylePlayer(UIScoreboard scoreboard, Player player) {
+            if (scoreboard == null || player == null || !player)
+                return;
+
+            VisualElement scoreboardContainer = SystemFunc.GetPrivateField<VisualElement>(typeof(UIScoreboard), scoreboard, "scoreboard");
+            VisualElement headerRow = SystemFunc.GetPrivateField<VisualElement>(typeof(UIScoreboard), scoreboard, "header");
+            if (scoreboardContainer == null)
+                return;
+
+            EnsureScoreboardColumnInfrastructure(scoreboardContainer, headerRow);
+
+            // Retry team tooltip setup if the initial handshake attempt failed (e.g. scoreboard was hidden).
+            if (_serverHasResponded && !_teamTooltipsSetup && !_teamTooltipSetupScheduled
+                && scoreboardContainer.worldBound.width > 0) {
+                SetupTeamTooltips(scoreboardContainer);
+            }
+
+            var playerMap = SystemFunc.GetPrivateField<Dictionary<Player, VisualElement>>(typeof(UIScoreboard), scoreboard, "playerVisualElementMap");
+            if (playerMap != null && playerMap.TryGetValue(player, out VisualElement rowElement)) {
+                EnsurePlayerScoreboardRow(player, rowElement, scoreboardContainer);
+                SyncSogLabelColorForContainer(rowElement.Q("Player"));
+                ScheduleSogLabelColorSync(rowElement, rowElement.Q("Player"));
+            }
+
+            scoreboardContainer.schedule.Execute(() => SyncSogColumnLayout(scoreboardContainer)).ExecuteLater(0);
+            ScheduleScoreboardReorder(scoreboardContainer);
+
+            string playerSteamId = player.SteamId.Value.Value;
+            if (!string.IsNullOrEmpty(playerSteamId) && _stars.Values.Contains(playerSteamId) && playerMap != null && playerMap.TryGetValue(player, out VisualElement starRow))
+                ApplyScoreboardStarTag(starRow.Query<Label>("UsernameLabel"), playerSteamId);
+        }
+
         /// <summary>
         /// Method used to modify the scoreboard to add additional stats.
         /// </summary>
         /// <param name="enable">Bool, true if new stats scoreboard has to added to the scoreboard. False if they need to be removed.</param>
+
         private static void ScoreboardModifications(bool enable) {
-            if (UIScoreboard.Instance == null)
+            if (MonoBehaviourSingleton<UIManager>.Instance.Scoreboard == null) {
+                #if DEBUG_MODE
+                DebugTrace.Write("ScoreboardMod", $"ABORT - UIManager.Instance.Scoreboard is null.");
+                #endif
                 return;
-
-            VisualElement scoreboardContainer = SystemFunc.GetPrivateField<VisualElement>(typeof(UIScoreboard), UIScoreboard.Instance, "container");
-
-            if (enable) {
-                // Always check if header exists in UI first (regardless of our tracking)
-                // This ensures we handle conflicts with other mods properly
-                bool headerExistsInUI = false;
-                foreach (VisualElement ve in scoreboardContainer.Children()) {
-                    if (ve is TemplateContainer && ve.childCount == 1) {
-                        VisualElement templateContainer = ve.Children().First();
-                        VisualElement existingHeader = templateContainer.Children().FirstOrDefault(x => x.name == SOG_HEADER_LABEL_NAME);
-                        if (existingHeader != null) {
-                            headerExistsInUI = true;
-                            break;
-                        }
-                    }
-                }
-
-                // Only add header if it doesn't exist in UI AND we haven't added it ourselves
-                if (!headerExistsInUI && !_hasUpdatedUIScoreboard.Contains("header")) {
-                    foreach (VisualElement ve in scoreboardContainer.Children()) {
-                        if (ve is TemplateContainer && ve.childCount == 1) {
-                            VisualElement templateContainer = ve.Children().First();
-
-                            // Double-check and remove any existing header (safety check)
-                            VisualElement existingHeader = templateContainer.Children().FirstOrDefault(x => x.name == SOG_HEADER_LABEL_NAME);
-                            if (existingHeader != null) {
-                                templateContainer.Remove(existingHeader);
-                                // If another mod already added the header, labels may have been shifted
-                                // Reset them to original position first, then we'll apply our shift
-                                foreach (VisualElement child in templateContainer.Children()) {
-                                    if (child.name == "GoalsLabel" || child.name == "AssistsLabel" || child.name == "PointsLabel")
-                                        child.transform.position = new Vector3(child.transform.position.x + 100, child.transform.position.y, child.transform.position.z);
-                                }
-                            }
-
-                            // Add S/Sv% header (matching other mod's format)
-                            Label sogHeader = new Label("S/Sv%") {
-                                name = SOG_HEADER_LABEL_NAME,
-                            };
-                            templateContainer.Add(sogHeader);
-                            sogHeader.transform.position = new Vector3(sogHeader.transform.position.x - 260, sogHeader.transform.position.y + 15, sogHeader.transform.position.z);
-
-                            // Shift Goals/Assists/Points labels to the left to make room (original behavior)
-                            foreach (VisualElement child in templateContainer.Children()) {
-                                if (child.name == "GoalsLabel" || child.name == "AssistsLabel" || child.name == "PointsLabel")
-                                    child.transform.position = new Vector3(child.transform.position.x - 100, child.transform.position.y, child.transform.position.z);
-                            }
-                        }
-                    }
-
-                    _hasUpdatedUIScoreboard.Add("header");
-                }
-                
-                // Setup team tooltips for team scores - only if server has the mod
-                if (_serverHasResponded && enable) {
-                    SetupTeamTooltips(scoreboardContainer);
-                }
-            }
-            else if (_hasUpdatedUIScoreboard.Contains("header") && !enable) {
-                foreach (VisualElement ve in scoreboardContainer.Children()) {
-                    if (ve is TemplateContainer && ve.childCount == 1) {
-                        VisualElement templateContainer = ve.Children().First();
-
-                        templateContainer.Remove(templateContainer.Children().First(x => x.name == SOG_HEADER_LABEL_NAME));
-
-                        // Restore Goals/Assists/Points labels to original position
-                        foreach (VisualElement child in templateContainer.Children()) {
-                            if (child.name == "GoalsLabel" || child.name == "AssistsLabel" || child.name == "PointsLabel")
-                                child.transform.position = new Vector3(child.transform.position.x + 100, child.transform.position.y, child.transform.position.z);
-                        }
-                    }
-                }
             }
 
-            foreach (var kvp in SystemFunc.GetPrivateField<Dictionary<Player, VisualElement>>(typeof(UIScoreboard), UIScoreboard.Instance, "playerVisualElementMap")) {
-                string playerSteamId = kvp.Key.SteamId.Value.ToString();
+            VisualElement scoreboardContainer = SystemFunc.GetPrivateField<VisualElement>(typeof(UIScoreboard), MonoBehaviourSingleton<UIManager>.Instance.Scoreboard, "scoreboard");
+            VisualElement headerRow = SystemFunc.GetPrivateField<VisualElement>(typeof(UIScoreboard), MonoBehaviourSingleton<UIManager>.Instance.Scoreboard, "header");
 
-                if (string.IsNullOrEmpty(playerSteamId))
-                    continue;
-
-                if (enable) {
-                    // Check if SOG label exists in UI first (regardless of our tracking)
-                    bool sogLabelExistsInUI = false;
-                    if (kvp.Value.childCount > 0) {
-                        VisualElement playerContainer = kvp.Value.Children().First();
-                        VisualElement existingSogLabel = playerContainer.Children().FirstOrDefault(x => x.name == SOG_LABEL);
-                        if (existingSogLabel != null) {
-                            sogLabelExistsInUI = true;
-                        }
-                    }
-
-                    // Only add label if it doesn't exist in UI AND we haven't added it ourselves
-                    if (!sogLabelExistsInUI && !_hasUpdatedUIScoreboard.Contains(playerSteamId)) {
-                        if (kvp.Value.childCount > 0) {
-                            VisualElement playerContainer = kvp.Value.Children().First();
-
-                            Player currentPlayer = kvp.Key;
-                            // Use GetPlayerPosition to match play-by-play detection method
-                            bool isGoalie = GetPlayerPosition(currentPlayer) == "G";
-
-                            // Double-check and remove any existing SOG label (safety check)
-                            VisualElement existingSogLabel = playerContainer.Children().FirstOrDefault(x => x.name == SOG_LABEL);
-                            if (existingSogLabel != null) {
-                                playerContainer.Remove(existingSogLabel);
-                                // If another mod already added the label, Goals/Assists/Points labels may have been shifted
-                                // Reset them to original position first, then we'll apply our shift
-                                foreach (VisualElement child in playerContainer.Children()) {
-                                    if (child.name == "GoalsLabel" || child.name == "AssistsLabel" || child.name == "PointsLabel")
-                                        child.transform.position = new Vector3(child.transform.position.x + 100, child.transform.position.y, child.transform.position.z);
-                                }
-                            }
-
-                            // Add SOG label (original position)
-                            Label sogLabel = new Label("0") {
-                                name = SOG_LABEL
-                            };
-                            sogLabel.style.flexGrow = 1;
-                            sogLabel.style.unityTextAlign = TextAnchor.UpperRight;
-                            playerContainer.Add(sogLabel);
-                            sogLabel.transform.position = new Vector3(sogLabel.transform.position.x - 225, sogLabel.transform.position.y, sogLabel.transform.position.z);
-                            _sogLabels.Add(playerSteamId, sogLabel);
-
-                            // Shift Goals/Assists/Points labels to the left to make room (original behavior)
-                            foreach (VisualElement child in playerContainer.Children()) {
-                                if (child.name == "GoalsLabel" || child.name == "AssistsLabel" || child.name == "PointsLabel")
-                                    child.transform.position = new Vector3(child.transform.position.x - 100, child.transform.position.y, child.transform.position.z);
-                            }
-                            
-                            // Store the font size from the SOG label for tooltip labels
-                            float defaultFontSize = sogLabel.resolvedStyle.fontSize > 0 ? sogLabel.resolvedStyle.fontSize : 13;
-
-                        // Add tooltip to player name label - search more thoroughly
-                        Label nameLabel = null;
-                        
-                        // First, try direct children
-                        foreach (VisualElement child in playerContainer.Children()) {
-                            if (child is Label label) {
-                                string childName = label.name?.ToLower() ?? "";
-                                if (childName.Contains("username") || childName.Contains("name") || childName == "usernamelabel" || childName == "namelabel") {
-                                    nameLabel = label;
-                                    break;
-                                }
-                            }
-                        }
-                        
-                        // If not found, try query
-                        if (nameLabel == null) {
-                            try {
-                                var queryResult = playerContainer.Query<Label>("UsernameLabel");
-                                if (queryResult != null) {
-                                    nameLabel = queryResult.First();
-                                }
-                            } catch { }
-                        }
-                        
-                        // If still not found, try searching all labels
-                        if (nameLabel == null) {
-                            var allLabels = playerContainer.Query<Label>().ToList();
-                            foreach (var label in allLabels) {
-                                if (label.text != null && label.text.Contains(currentPlayer.Username.Value.ToString())) {
-                                    nameLabel = label;
-                                    break;
-                                }
-                            }
-                        }
-                        
-                        if (nameLabel != null && _serverHasResponded) {
-                            // Enable picking mode so the label can receive mouse events
-                            nameLabel.pickingMode = PickingMode.Position;
-                            // Also enable picking on the container
-                            playerContainer.pickingMode = PickingMode.Position;
-                            // Get font size from name label or SOG label
-                            float tooltipFontSize = nameLabel.resolvedStyle.fontSize > 0 ? nameLabel.resolvedStyle.fontSize : (sogLabel.resolvedStyle.fontSize > 0 ? sogLabel.resolvedStyle.fontSize : 13f);
-                            SetupPlayerTooltip(nameLabel, playerContainer, playerSteamId, currentPlayer, nameLabel, tooltipFontSize);
-                        }
-
-                        _hasUpdatedUIScoreboard.Add(playerSteamId);
-
-                        if (!_sog.TryGetValue(playerSteamId, out int _))
-                            _sog.Add(playerSteamId, 0);
-                        }
-                    }
-                    // Check if player's position changed - recreate tooltip if needed
-                    else if (_hasUpdatedUIScoreboard.Contains(playerSteamId) && enable && kvp.Value.childCount > 0) {
-                        Player currentPlayer = kvp.Key;
-                        // Use GetPlayerPosition to match play-by-play detection method
-                        bool isGoalie = GetPlayerPosition(currentPlayer) == "G";
-                        
-                        // Check if position changed
-                        if (_playerTooltipIsGoalie.TryGetValue(playerSteamId, out bool wasGoalie)) {
-                            if (wasGoalie != isGoalie) {
-                                // Position changed - recreate tooltip
-                                VisualElement playerContainer = kvp.Value.Children().First();
-                                Label nameLabel = null;
-                                
-                                // Find name label
-                                foreach (VisualElement child in playerContainer.Children()) {
-                                    if (child is Label label) {
-                                        string childName = label.name?.ToLower() ?? "";
-                                        if (childName.Contains("username") || childName.Contains("name") || childName == "usernamelabel" || childName == "namelabel") {
-                                            nameLabel = label;
-                                            break;
-                                        }
-                                    }
-                                }
-                                
-                                if (nameLabel == null) {
-                                    try {
-                                        var queryResult = playerContainer.Query<Label>("UsernameLabel");
-                                        if (queryResult != null) {
-                                            nameLabel = queryResult.First();
-                                        }
-                                    } catch { }
-                                }
-                                
-                                if (nameLabel == null) {
-                                    var allLabels = playerContainer.Query<Label>().ToList();
-                                    foreach (var label in allLabels) {
-                                        if (label.text != null && label.text.Contains(currentPlayer.Username.Value.ToString())) {
-                                            nameLabel = label;
-                                            break;
-                                        }
-                                    }
-                                }
-                                
-                                if (nameLabel != null && _serverHasResponded) {
-                                    Label sogLabel = null;
-                                    if (_sogLabels.TryGetValue(playerSteamId, out Label existingSogLabel)) {
-                                        sogLabel = existingSogLabel;
-                                    }
-                                    float tooltipFontSize = nameLabel.resolvedStyle.fontSize > 0 ? nameLabel.resolvedStyle.fontSize : (sogLabel != null && sogLabel.resolvedStyle.fontSize > 0 ? sogLabel.resolvedStyle.fontSize : 13f);
-                                    SetupPlayerTooltip(nameLabel, playerContainer, playerSteamId, currentPlayer, nameLabel, tooltipFontSize);
-                                }
-                            }
-                        }
-
-                        if (!_savePerc.TryGetValue(playerSteamId, out (int, int) _))
-                            _savePerc.Add(playerSteamId, (0, 0));
-
-                        // Initialize stats for all players (including goalies)
-                        if (!_hits.TryGetValue(playerSteamId, out int _))
-                            _hits.Add(playerSteamId, 0);
-                        if (!_turnovers.TryGetValue(playerSteamId, out int _))
-                            _turnovers.Add(playerSteamId, 0);
-                        if (!_takeaways.TryGetValue(playerSteamId, out int _))
-                            _takeaways.Add(playerSteamId, 0);
-                        if (!_passes.TryGetValue(playerSteamId, out int _))
-                            _passes.Add(playerSteamId, 0);
-                    }
-                    else if (_hasUpdatedUIScoreboard.Contains(playerSteamId) && !enable) {
-                        VisualElement playerContainer = kvp.Value.Children().First();
-                        playerContainer.Remove(playerContainer.Children().First(x => x.name == SOG_LABEL));
-
-                        // Restore Goals/Assists/Points labels to original position
-                        foreach (VisualElement child in playerContainer.Children()) {
-                            if (child.name == "GoalsLabel" || child.name == "AssistsLabel" || child.name == "PointsLabel")
-                                child.transform.position = new Vector3(child.transform.position.x + 100, child.transform.position.y, child.transform.position.z);
-                        }
-                        
-                        // Remove tooltip
-                        if (_playerTooltips.TryGetValue(playerSteamId, out VisualElement tooltip)) {
-                            tooltip.parent?.Remove(tooltip);
-                            _playerTooltips.Remove(playerSteamId);
-                        }
-                        _playerTooltipNameLabels.Remove(playerSteamId);
-                        _playerTooltipContainers.Remove(playerSteamId);
-                        _playerTooltipIsGoalie.Remove(playerSteamId);
-                    }
-                    else {
-                        Logging.Log($"Not adding player {kvp.Key.Username.Value}, childCount {kvp.Value.childCount}.", _clientConfig, true);
-                        foreach (var test in kvp.Value.Children())
-                            Logging.Log($"{test.name}", _clientConfig, true);
-                    }
-                }
-            }
-
-            // Reorder players by position if enabled
-            if (enable) {
-                ReorderScoreboardPlayers(scoreboardContainer);
-            }
+            #if DEBUG_MODE
+            DebugTrace.Write("ScoreboardMod", $"enable={enable} scoreboardContainer={scoreboardContainer != null} headerRow={headerRow != null} serverHasResponded={_serverHasResponded}");
+            #endif
 
             if (!enable) {
+                HideAllPlayerTooltips();
+                UnregisterScoreboardColumnSync();
+
+                if (headerRow != null) {
+                    VisualElement stale = headerRow.Children().FirstOrDefault(x => x.name == SOG_HEADER_LABEL_NAME);
+                    if (stale != null)
+                        headerRow.Remove(stale);
+                }
+
+                var playerMapDisable = SystemFunc.GetPrivateField<Dictionary<Player, VisualElement>>(typeof(UIScoreboard), MonoBehaviourSingleton<UIManager>.Instance.Scoreboard, "playerVisualElementMap");
+                if (playerMapDisable != null) {
+                    foreach (var kvp in playerMapDisable)
+                        RemovePlayerScoreboardRow(kvp.Key.SteamId.Value.Value, kvp.Value);
+                }
+
                 _sog.Clear();
                 _savePerc.Clear();
                 _sogLabels.Clear();
@@ -5847,67 +6613,36 @@ namespace oomtm450PuckMod_Stats {
                 _playerTooltipNameLabels.Clear();
                 _playerTooltipContainers.Clear();
                 _playerTooltipIsGoalie.Clear();
+                _playerTooltipPointerHandlers.Clear();
+                _sogHoverCallbacksRegistered.Clear();
                 _hasUpdatedUIScoreboard.Clear();
                 _teamTooltipsSetup = false;
-            }
-            else if (enable && _serverHasResponded) {
-                // Retry tooltip setup for players that have UI elements but no tooltips
-                foreach (var kvp in SystemFunc.GetPrivateField<Dictionary<Player, VisualElement>>(typeof(UIScoreboard), UIScoreboard.Instance, "playerVisualElementMap")) {
-                    string playerSteamId = kvp.Key.SteamId.Value.ToString();
-                    
-                    if (string.IsNullOrEmpty(playerSteamId))
-                        continue;
-                    
-                    // If player has UI elements set up but no tooltip, try to set it up
-                    if (_hasUpdatedUIScoreboard.Contains(playerSteamId) && !_playerTooltips.ContainsKey(playerSteamId) && kvp.Value.childCount > 0) {
-                        VisualElement playerContainer = kvp.Value.Children().First();
-                        Player currentPlayer = kvp.Key;
-                        
-                        // Try to find the name label again
-                        Label nameLabel = null;
-                        
-                        // First, try direct children
-                        foreach (VisualElement child in playerContainer.Children()) {
-                            if (child is Label label) {
-                                string childName = label.name?.ToLower() ?? "";
-                                if (childName.Contains("username") || childName.Contains("name") || childName == "usernamelabel" || childName == "namelabel") {
-                                    nameLabel = label;
-                                    break;
-                                }
-                            }
-                        }
-                        
-                        // If not found, try query
-                        if (nameLabel == null) {
-                            try {
-                                var queryResult = playerContainer.Query<Label>("UsernameLabel");
-                                if (queryResult != null) {
-                                    nameLabel = queryResult.First();
-                                }
-                            } catch { }
-                        }
-                        
-                        // If still not found, try searching all labels
-                        if (nameLabel == null) {
-                            var allLabels = playerContainer.Query<Label>().ToList();
-                            foreach (var label in allLabels) {
-                                if (label.text != null && label.text.Contains(currentPlayer.Username.Value.ToString())) {
-                                    nameLabel = label;
-                                    break;
-                                }
-                            }
-                        }
-                        
-                        // If we found the name label, set up the tooltip
-                        if (nameLabel != null && _sogLabels.TryGetValue(playerSteamId, out Label sogLabel)) {
-                            nameLabel.pickingMode = PickingMode.Position;
-                            playerContainer.pickingMode = PickingMode.Position;
-                            float tooltipFontSize = nameLabel.resolvedStyle.fontSize > 0 ? nameLabel.resolvedStyle.fontSize : (sogLabel.resolvedStyle.fontSize > 0 ? sogLabel.resolvedStyle.fontSize : 13f);
-                            SetupPlayerTooltip(nameLabel, playerContainer, playerSteamId, currentPlayer, nameLabel, tooltipFontSize);
-                        }
-                    }
+                _teamTooltipSetupScheduled = false;
+                foreach (var kvp in new List<KeyValuePair<PlayerTeam, VisualElement>>(_teamHitAreas)) {
+                    kvp.Value?.parent?.Remove(kvp.Value);
                 }
+                _teamHitAreas.Clear();
+                _teamTooltips.Clear();
+                return;
             }
+
+            EnsureScoreboardColumnInfrastructure(scoreboardContainer, headerRow);
+
+            if (_serverHasResponded) {
+                SetupTeamTooltips(scoreboardContainer);
+                RefreshTeamHitAreaPositions(scoreboardContainer);
+            }
+
+            var playerMap = SystemFunc.GetPrivateField<Dictionary<Player, VisualElement>>(typeof(UIScoreboard), MonoBehaviourSingleton<UIManager>.Instance.Scoreboard, "playerVisualElementMap");
+            if (playerMap != null) {
+                foreach (var kvp in playerMap)
+                    EnsurePlayerScoreboardRow(kvp.Key, kvp.Value, scoreboardContainer);
+            }
+
+            SyncSogColumnLayout(scoreboardContainer);
+            scoreboardContainer?.schedule.Execute(() => SyncSogColumnLayout(scoreboardContainer)).ExecuteLater(100);
+
+            ReorderScoreboardPlayers(scoreboardContainer);
         }
 
         /// <summary>
@@ -5929,28 +6664,15 @@ namespace oomtm450PuckMod_Stats {
         /// <summary>
         /// Helper function to create a label with consistent styling.
         /// </summary>
-        private static Label CreateTooltipLabel(string text, string name, string playerSteamId, Label referenceLabel, float defaultFontSize = 13f) {
+        private static Label CreateTooltipLabel(string text, string name, string playerSteamId, Label referenceLabel, float defaultFontSize = 18f) {
             Label label = new Label(text) { name = name + "_" + playerSteamId };
             label.text = text;
-            if (referenceLabel != null) {
-                label.style.fontSize = referenceLabel.resolvedStyle.fontSize;
-                label.style.color = referenceLabel.resolvedStyle.color;
-                label.style.unityTextAlign = referenceLabel.resolvedStyle.unityTextAlign;
-                label.style.whiteSpace = referenceLabel.resolvedStyle.whiteSpace;
-                try {
-                    var fontAssetField = typeof(Label).GetField("fontAsset", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-                    if (fontAssetField != null) {
-                        var fontAsset = fontAssetField.GetValue(referenceLabel) as UnityEngine.Font;
-                        if (fontAsset != null) {
-                            fontAssetField.SetValue(label, fontAsset);
-                        }
-                    }
-                } catch { }
-            } else {
-                label.style.fontSize = defaultFontSize;
-                label.style.color = new StyleColor(new Color(1f, 1f, 1f, 1f));
-                label.style.unityTextAlign = TextAnchor.UpperLeft;
-            }
+            // Use fixed styling — never inherit from referenceLabel, whose resolvedStyle varies
+            // per player and returns 0 for mid-game joiners causing inconsistent tooltip appearance.
+            label.style.fontSize = defaultFontSize;
+            label.style.color = new StyleColor(new Color(1f, 1f, 1f, 1f));
+            label.style.unityTextAlign = TextAnchor.UpperLeft;
+            label.style.whiteSpace = WhiteSpace.Normal;
             label.style.marginBottom = 2;
             label.style.width = Length.Percent(100);
             label.style.minHeight = 18;
@@ -5981,8 +6703,10 @@ namespace oomtm450PuckMod_Stats {
             // Special case: Pink for specific SteamIDs
             if (trimmedSteamId == "76561198050995236" ||
                 trimmedSteamId == "76561198068597258" ||
+                trimmedSteamId == "76561198022179232" ||
                 trimmedSteamId == "76561198155889632" ||
-                trimmedSteamId == "76561198980346669") {
+                trimmedSteamId == "76561198980346669" ||
+                trimmedSteamId == "76561199122116162") {
                 return new Color(0.8f, 0.4f, 0.7f, 0.95f); // Pink color
             }
             
@@ -6000,8 +6724,11 @@ namespace oomtm450PuckMod_Stats {
         /// Sets up a tooltip that appears when hovering over a player's name.
         /// </summary>
         private static void SetupPlayerTooltip(Label nameLabel, VisualElement playerContainer, string playerSteamId, Player player, Label referenceLabel, float defaultFontSize = 13f) {
+            UnregisterPlayerTooltipPointerHandlers(playerSteamId);
+
             // Remove existing tooltip if it exists
             if (_playerTooltips.TryGetValue(playerSteamId, out VisualElement existingTooltip)) {
+                existingTooltip.style.display = DisplayStyle.None;
                 existingTooltip.parent?.Remove(existingTooltip);
                 _playerTooltips.Remove(playerSteamId);
             }
@@ -6042,35 +6769,20 @@ namespace oomtm450PuckMod_Stats {
             tooltip.style.opacity = 1f;
             
 
-            // Create stat labels with proper styling - copy ALL styles from reference label
-            Label titleLabel = new Label(player.Username.Value.ToString());
-            titleLabel.text = player.Username.Value.ToString();
-            
-            // Copy ALL style properties from the reference label to ensure identical rendering
-            if (referenceLabel != null) {
-                // Copy all text-related styles
-                titleLabel.style.fontSize = referenceLabel.resolvedStyle.fontSize + 3;
-                titleLabel.style.unityFontStyleAndWeight = FontStyle.Bold;
-                titleLabel.style.color = referenceLabel.resolvedStyle.color;
-                titleLabel.style.unityTextAlign = referenceLabel.resolvedStyle.unityTextAlign;
-                titleLabel.style.whiteSpace = referenceLabel.resolvedStyle.whiteSpace;
-                // Try to copy font asset if accessible using reflection
-                try {
-                    var fontAssetField = typeof(Label).GetField("fontAsset", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-                    if (fontAssetField != null) {
-                        var fontAsset = fontAssetField.GetValue(referenceLabel) as UnityEngine.Font;
-                        if (fontAsset != null) {
-                            fontAssetField.SetValue(titleLabel, fontAsset);
-                        }
-                    }
-                } catch {
-                }
-            } else {
-                titleLabel.style.fontSize = defaultFontSize + 3;
-                titleLabel.style.unityFontStyleAndWeight = FontStyle.Bold;
-                titleLabel.style.color = new StyleColor(new Color(1f, 1f, 1f, 1f));
-                titleLabel.style.unityTextAlign = TextAnchor.UpperLeft;
-            }
+            // Fixed constants for all player tooltips — never inherit from the reference label
+            // (referenceLabel.resolvedStyle varies per player and returns 0 for mid-game joiners,
+            // which caused inconsistent font sizes and text alignment across tooltips).
+            const float TOOLTIP_TITLE_FONT_SIZE = 22f;
+            const float TOOLTIP_STAT_FONT_SIZE  = 18f;
+            defaultFontSize = TOOLTIP_STAT_FONT_SIZE; // ensure all CreateTooltipLabel calls use the fixed size
+
+            Label titleLabel = new Label(player.Username.Value.Value);
+            titleLabel.text = player.Username.Value.Value;
+            titleLabel.style.fontSize = TOOLTIP_TITLE_FONT_SIZE;
+            titleLabel.style.unityFontStyleAndWeight = FontStyle.Bold;
+            titleLabel.style.color = new StyleColor(new Color(1f, 1f, 1f, 1f));
+            titleLabel.style.unityTextAlign = TextAnchor.UpperLeft;
+            titleLabel.style.whiteSpace = WhiteSpace.Normal;
             
             titleLabel.style.marginBottom = 8;
             titleLabel.style.width = Length.Percent(100);
@@ -6085,7 +6797,7 @@ namespace oomtm450PuckMod_Stats {
             
             // Force text to be set again after all styles are applied
             titleLabel.schedule.Execute(() => {
-                titleLabel.text = player.Username.Value.ToString();
+                titleLabel.text = player.Username.Value.Value;
                 titleLabel.MarkDirtyRepaint();
             });
             
@@ -6155,22 +6867,35 @@ namespace oomtm450PuckMod_Stats {
 
             // Add tooltip to the scoreboard container (same parent as scoreboard elements) to ensure proper rendering context
             try {
-                VisualElement scoreboardContainer = SystemFunc.GetPrivateField<VisualElement>(typeof(UIScoreboard), UIScoreboard.Instance, "container");
+                VisualElement scoreboardContainer = SystemFunc.GetPrivateField<VisualElement>(typeof(UIScoreboard), MonoBehaviourSingleton<UIManager>.Instance.Scoreboard, "scoreboard");
+                #if DEBUG_MODE
+                DebugTrace.Write("SetupTooltip", $"player={playerSteamId} scoreboardContainer={scoreboardContainer != null}");
+                #endif
                 if (scoreboardContainer != null) {
                     scoreboardContainer.Add(tooltip);
                     scoreboardContainer.style.overflow = Overflow.Visible;
+                    #if DEBUG_MODE
+                    DebugTrace.Write("SetupTooltip", $"Tooltip added to scoreboardContainer. Tooltip name={tooltip.name}");
+                    #endif
                 } else {
                     // Fallback to root
-                    var root = UIScoreboard.Instance?.GetComponent<UnityEngine.UIElements.UIDocument>()?.rootVisualElement;
+                    var root = MonoBehaviourSingleton<UIManager>.Instance.Scoreboard?.GetComponent<UnityEngine.UIElements.UIDocument>()?.rootVisualElement;
+                    #if DEBUG_MODE
+                    DebugTrace.Write("SetupTooltip", $"scoreboardContainer null - trying UIDocument root={root != null}");
+                    #endif
                     if (root != null) {
                         root.Add(tooltip);
                         root.style.overflow = Overflow.Visible;
                     } else {
-                        Logging.LogError("Could not find container or root for tooltip", _clientConfig);
+                        #if DEBUG_MODE
+                        DebugTrace.Write("SetupTooltip", $"FAILED - Could not find container or root for tooltip");
+                        #endif
                     }
                 }
             } catch (Exception ex) {
-                Logging.LogError($"Error adding tooltip: {ex}", _clientConfig);
+                #if DEBUG_MODE
+                DebugTrace.Write("SetupTooltip", $"Exception adding tooltip: {ex}");
+                #endif
             }
             
             _playerTooltips.Add(playerSteamId, tooltip);
@@ -6187,141 +6912,81 @@ namespace oomtm450PuckMod_Stats {
             tooltip.pickingMode = PickingMode.Ignore; // Tooltip shouldn't block mouse events
             
             // Register events on both the label AND the container for better coverage
+            // Tooltip never intercepts pointer events — must not block the row beneath it
+            tooltip.pickingMode = PickingMode.Ignore;
+            foreach (var child in tooltip.Children())
+                child.pickingMode = PickingMode.Ignore;
+
+            bool tooltipPositioned = false;
+
             Action showTooltip = () => {
                 try {
-                    // Only show tooltip if server has the stats mod
-                    // If tooltip exists, show it (tooltip creation already requires _serverHasResponded to be true)
-                    // This handles cases where tooltip was created but _serverHasResponded got reset
-                    if (!_serverHasResponded && !_playerTooltips.ContainsKey(playerSteamId)) {
-                        return; // Don't show if server hasn't responded AND tooltip doesn't exist
-                    }
-                    
-                    // Check if player's position has changed - recreate tooltip if needed
+                    if (!_serverHasResponded && !_playerTooltips.ContainsKey(playerSteamId))
+                        return;
+
+                    // Recreate tooltip if the player switched positions (skater ↔ goalie)
                     if (player != null && player) {
                         bool currentIsGoalie = GetPlayerPosition(player) == "G";
                         if (_playerTooltipIsGoalie.TryGetValue(playerSteamId, out bool wasGoalie) && wasGoalie != currentIsGoalie) {
-                            // Position changed - recreate tooltip with correct structure
-                            if (_playerTooltipNameLabels.TryGetValue(playerSteamId, out Label storedNameLabel) && 
+                            if (_playerTooltipNameLabels.TryGetValue(playerSteamId, out Label storedNameLabel) &&
                                 _playerTooltipContainers.TryGetValue(playerSteamId, out VisualElement storedContainer) &&
                                 storedNameLabel != null && storedContainer != null) {
-                                float tooltipFontSize = storedNameLabel.resolvedStyle.fontSize > 0 ? storedNameLabel.resolvedStyle.fontSize : 13f;
-                                SetupPlayerTooltip(storedNameLabel, storedContainer, playerSteamId, player, storedNameLabel, tooltipFontSize);
-                                // Get the newly created tooltip
-                                if (_playerTooltips.TryGetValue(playerSteamId, out VisualElement newTooltip)) {
+                                SetupPlayerTooltip(storedNameLabel, storedContainer, playerSteamId, player, storedNameLabel);
+                                if (_playerTooltips.TryGetValue(playerSteamId, out VisualElement newTooltip))
                                     tooltip = newTooltip;
-                                }
+                                tooltipPositioned = false; // force reposition for new tooltip
                             }
                         }
                     }
-                    
+
                     UpdateTooltipStats(tooltip, playerSteamId, player);
-                    // Reapply background color when showing tooltip
-                    tooltip.style.backgroundColor = GetColorFromSteamId(playerSteamId);
                     tooltip.style.display = DisplayStyle.Flex;
-                    tooltip.BringToFront();
-                    
-                    // Update tooltip stats periodically while visible (every 0.5 seconds)
-                    void UpdatePeriodically() {
-                        if (tooltip.style.display == DisplayStyle.Flex) {
-                            UpdateTooltipStats(tooltip, playerSteamId, player);
-                            tooltip.schedule.Execute(UpdatePeriodically).ExecuteLater(500);
-                        }
+
+                    // Only position once per hover session. Repositioning on every re-enter
+                    // (which layout passes can trigger) causes upward drift because
+                    // resolvedStyle.height grows as content is measured after the first frame.
+                    if (!tooltipPositioned) {
+                        tooltipPositioned = true;
+                        // Defer until after the first layout pass so resolvedStyle.height is real.
+                        tooltip.schedule.Execute(() => {
+                            if (tooltip.style.display == DisplayStyle.Flex)
+                                UpdateTooltipPosition(tooltip, nameLabel);
+                        }).ExecuteLater(50);
                     }
-                    tooltip.schedule.Execute(UpdatePeriodically).ExecuteLater(500);
-                    
-                    // Use a scheduled callback to update position after layout is calculated
-                    tooltip.schedule.Execute(() => {
-                        // Only update and log if tooltip is still visible
-                        if (tooltip.style.display == DisplayStyle.Flex) {
-                            UpdateTooltipPosition(tooltip, nameLabel);
-                            // Force layout recalculation
-                            tooltip.MarkDirtyRepaint();
-                            // Ensure all labels are visible and have proper text rendering
-                            foreach (Label label in tooltip.Children().OfType<Label>()) {
-                                // Force re-set text to ensure it's actually set
-                                string labelText = label.text;
-                                label.text = ""; // Clear first
-                                label.text = labelText; // Re-set
-                                
-                                label.style.color = new StyleColor(new Color(1f, 1f, 1f, 1f));
-                                label.style.opacity = 1f;
-                                label.style.visibility = Visibility.Visible;
-                                label.style.display = DisplayStyle.Flex;
-                                
-                                // Check if font size is valid
-                                float fontSize = label.resolvedStyle.fontSize;
-                                if (fontSize <= 0) {
-                                    label.style.fontSize = 13; // Set default if invalid
-                                }
-                                
-                                // Force text to render
-                                label.MarkDirtyRepaint();
-                                
-                                // Log the actual text content to verify it's set
-                            }
-                            // Log tooltip dimensions after layout (only if visible)
-                            float resolvedWidth = tooltip.resolvedStyle.width;
-                            float resolvedHeight = tooltip.resolvedStyle.height;
-                            if (resolvedWidth > 0 && resolvedHeight > 0) {
-                                float layoutHeight = tooltip.layout.height;
-                                // Log each label's height, text content, and font size
-                                var labelInfo = tooltip.Children().OfType<Label>().Select(l => {
-                                    float fontSize = l.resolvedStyle.fontSize;
-                                    float labelHeight = l.layout.height;
-                                    return $"'{l.text}' (fontSize: {fontSize}, height: {labelHeight}, color: {l.resolvedStyle.color}, opacity: {l.resolvedStyle.opacity})";
-                                }).ToList();
-                            }
-                        }
-                    });
+
+                    // Stats are frozen while hovering — no periodic updates.
+                    // Periodic text changes trigger layout passes which cause Unity UI Toolkit
+                    // to re-evaluate pointer state, producing spurious PointerLeave/Enter pairs
+                    // every 500ms (audible tick + drift). Stats update on the next hover instead.
                 } catch (Exception ex) {
                     Logging.LogError($"Error showing tooltip: {ex}", _clientConfig);
                 }
             };
-            
-            Action hideTooltip = () => {
-                tooltip.style.display = DisplayStyle.None;
-            };
-            
-            // Register on label
-            nameLabel.RegisterCallback<MouseEnterEvent>(evt => showTooltip());
-            nameLabel.RegisterCallback<PointerEnterEvent>(evt => showTooltip());
-            nameLabel.RegisterCallback<MouseLeaveEvent>(evt => hideTooltip());
-            nameLabel.RegisterCallback<PointerLeaveEvent>(evt => hideTooltip());
-            
-            // Also register on the entire player container row
-            playerContainer.RegisterCallback<MouseEnterEvent>(evt => {
-                if (evt.target == nameLabel || evt.target == playerContainer) {
-                    showTooltip();
-                }
-            });
-            playerContainer.RegisterCallback<PointerEnterEvent>(evt => {
-                if (evt.target == nameLabel || evt.target == playerContainer) {
-                    showTooltip();
-                }
-            });
-            playerContainer.RegisterCallback<MouseLeaveEvent>(evt => hideTooltip());
-            playerContainer.RegisterCallback<PointerLeaveEvent>(evt => hideTooltip());
 
-            // Update position on mouse move (throttled to reduce excessive logging)
-            nameLabel.RegisterCallback<MouseMoveEvent>(evt => {
-                if (tooltip.style.display == DisplayStyle.Flex) {
-                    float currentTime = UnityEngine.Time.time;
-                    if (!_tooltipMoveTimes.ContainsKey(tooltip) || currentTime - _tooltipMoveTimes[tooltip] > 0.1f) {
-                        _tooltipMoveTimes[tooltip] = currentTime;
-                        UpdateTooltipPosition(tooltip, nameLabel);
-                    }
-                }
-            });
-            
-            playerContainer.RegisterCallback<MouseMoveEvent>(evt => {
-                if (tooltip.style.display == DisplayStyle.Flex) {
-                    float currentTime = UnityEngine.Time.time;
-                    if (!_tooltipMoveTimes.ContainsKey(tooltip) || currentTime - _tooltipMoveTimes[tooltip] > 0.1f) {
-                        _tooltipMoveTimes[tooltip] = currentTime;
-                        UpdateTooltipPosition(tooltip, nameLabel);
-                    }
-                }
-            });
+            // Use a tiny hide delay so that moving between child elements within the row
+            // doesn't fire PointerLeave → hide → PointerEnter → show in an infinite loop.
+            bool hideScheduled = false;
+            Action hideTooltip = () => {
+                if (hideScheduled) return;
+                hideScheduled = true;
+                playerContainer.schedule.Execute(() => {
+                    hideScheduled = false;
+                    tooltipPositioned = false; // reset so next hover gets a fresh position
+                    tooltip.style.display = DisplayStyle.None;
+                }).ExecuteLater(80);
+            };
+
+            // Only listen on the container row — NOT on nameLabel individually.
+            var pointerHandlers = new PlayerTooltipPointerHandlers {
+                Enter = _ => {
+                    hideScheduled = false;
+                    showTooltip();
+                },
+                Leave = _ => hideTooltip()
+            };
+            _playerTooltipPointerHandlers[playerSteamId] = pointerHandlers;
+            playerContainer.RegisterCallback(pointerHandlers.Enter);
+            playerContainer.RegisterCallback(pointerHandlers.Leave);
         }
 
         /// <summary>
@@ -6387,7 +7052,7 @@ namespace oomtm450PuckMod_Stats {
                 }
             }
             catch (Exception ex) {
-                Logging.LogError($"Error updating faceoff stats from pbp: {ex}", ServerConfig);
+                Logging.LogError($"Error updating faceoff stats from pbp: {ex}", ModServerConfig);
             }
         }
 
@@ -6441,7 +7106,7 @@ namespace oomtm450PuckMod_Stats {
                 }
             }
             catch (Exception ex) {
-                Logging.LogError($"Error updating body/stick saves from pbp: {ex}", ServerConfig);
+                Logging.LogError($"Error updating body/stick saves from pbp: {ex}", ModServerConfig);
             }
         }
 
@@ -6629,9 +7294,9 @@ namespace oomtm450PuckMod_Stats {
             string gwgSteamId = "";
             PlayerTeam winningTeam = PlayerTeam.None;
             try {
-                if (GameManager.Instance != null && GameManager.Instance.GameState != null) {
-                    int blueScore = GameManager.Instance.GameState.Value.BlueScore;
-                    int redScore = GameManager.Instance.GameState.Value.RedScore;
+                if (GameManager.Instance != null) {
+                    int blueScore = GameManager.Instance.BlueScore;
+                    int redScore = GameManager.Instance.RedScore;
                     
                     if (blueScore > redScore) {
                         winningTeam = PlayerTeam.Blue;
@@ -6673,7 +7338,7 @@ namespace oomtm450PuckMod_Stats {
             } catch { }
             
             double gwgModifier = gwgSteamId == playerSteamId ? 0.5d : 0;
-            double teamModifier = winningTeam == player.Team.Value ? 1.1d : 1d;
+            double teamModifier = winningTeam == player.Team ? 1.1d : 1d;
             
             if (PlayerFunc.IsGoalie(player)) {
                 // Simplified goalie point system
@@ -6751,181 +7416,189 @@ namespace oomtm450PuckMod_Stats {
         /// <summary>
         /// Sets up team tooltips for team score labels.
         /// </summary>
+        /// <summary>
+        /// Refreshes the screen-space positions of team score hit areas every frame while the
+        /// scoreboard is visible. This corrects any stale 0,0 positions that result from the
+        /// 600 ms deferred setup firing while the scoreboard was temporarily hidden.
+        /// </summary>
+        private static void RefreshTeamHitAreaPositions(VisualElement scoreboardContainer) {
+            if (_teamHitAreas.Count == 0) return;
+            try {
+                Rect containerWorld = scoreboardContainer.worldBound;
+                if (containerWorld.width <= 0) return;
+
+                UIGameState gameStatePanel = MonoBehaviourSingleton<UIManager>.Instance?.GameState;
+                if (gameStatePanel == null) return;
+
+                Label blueScoreLabel = SystemFunc.GetPrivateField<Label>(typeof(UIGameState), gameStatePanel, "blueScoreLabel");
+                Label redScoreLabel  = SystemFunc.GetPrivateField<Label>(typeof(UIGameState), gameStatePanel, "redScoreLabel");
+
+                foreach (var kvp in _teamHitAreas) {
+                    Label scoreLabel = kvp.Key == PlayerTeam.Blue ? blueScoreLabel : redScoreLabel;
+                    if (scoreLabel == null) continue;
+                    VisualElement hitArea = kvp.Value;
+                    if (hitArea == null) continue;
+
+                    Rect labelWorld = scoreLabel.worldBound;
+                    if (labelWorld.width <= 0) continue;
+
+                    float newLeft   = labelWorld.x - containerWorld.x;
+                    float newTop    = labelWorld.y - containerWorld.y;
+                    float newWidth  = Mathf.Max(labelWorld.width,  50f);
+                    float newHeight = Mathf.Max(labelWorld.height, 30f);
+
+                    // Only write if the values actually changed to avoid unnecessary style dirtying
+                    if (Mathf.Abs(hitArea.style.left.value.value   - newLeft)   > 0.5f ||
+                        Mathf.Abs(hitArea.style.top.value.value    - newTop)    > 0.5f ||
+                        Mathf.Abs(hitArea.style.width.value.value  - newWidth)  > 0.5f ||
+                        Mathf.Abs(hitArea.style.height.value.value - newHeight) > 0.5f) {
+                        hitArea.style.left   = newLeft;
+                        hitArea.style.top    = newTop;
+                        hitArea.style.width  = newWidth;
+                        hitArea.style.height = newHeight;
+                    }
+                }
+            } catch { }
+        }
+
         private static void SetupTeamTooltips(VisualElement scoreboardContainer) {
             try {
-                // Use a scheduled callback to ensure UI is fully loaded
+                if (_teamTooltipsSetup)
+                    return;
+
+                // Score labels live in UIGameState, a DIFFERENT UIDocument panel from UIScoreboard.
+                // UIScoreboard is rendered on top and absorbs all mouse events before they reach UIGameState.
+                // Solution: get the score labels for worldBound only; create invisible hit-area elements
+                // INSIDE scoreboardContainer (same panel as UIScoreboard) positioned over the score labels.
+                UIGameState gameStatePanel = MonoBehaviourSingleton<UIManager>.Instance?.GameState;
+                #if DEBUG_MODE
+                DebugTrace.Write("TeamSetup", $"SetupTeamTooltips called. gameStatePanel={gameStatePanel != null}");
+                #endif
+                if (gameStatePanel == null) {
+                    #if DEBUG_MODE
+                    DebugTrace.Write("TeamSetup", $"ABORT - UIGameState panel not available.");
+                    #endif
+                    return;
+                }
+
+                if (_teamTooltipSetupScheduled)
+                    return;
+                _teamTooltipSetupScheduled = true;
+
                 scoreboardContainer.schedule.Execute(() => {
                     try {
-                        // Guard: Only setup once, similar to how player tooltips work
-                        if (_teamTooltipsSetup) {
+                        if (_teamTooltipsSetup)
+                            return;
+
+                        // Bail if the scoreboard was closed while this deferred was pending.
+                        // Without this guard, hit areas are created with zero worldBound, their
+                        // 100 ms position-update also skips, and _teamTooltipsSetup is set to true
+                        // with stale 0,0 hit areas that never trigger hover events.
+                        if (scoreboardContainer.worldBound.width <= 0)
+                            return;
+
+                        Label blueScoreLabel = SystemFunc.GetPrivateField<Label>(typeof(UIGameState), gameStatePanel, "blueScoreLabel");
+                        Label redScoreLabel  = SystemFunc.GetPrivateField<Label>(typeof(UIGameState), gameStatePanel, "redScoreLabel");
+
+                        #if DEBUG_MODE
+                        DebugTrace.Write("TeamSetup", $"Scheduled: blueScoreLabel={blueScoreLabel != null} text='{blueScoreLabel?.text}' redScoreLabel={redScoreLabel != null} text='{redScoreLabel?.text}'");
+                        #endif
+
+                        if (blueScoreLabel == null || redScoreLabel == null) {
+                            #if DEBUG_MODE
+                            DebugTrace.Write("TeamSetup", $"ABORT - score labels not found (blue={blueScoreLabel != null}, red={redScoreLabel != null}).");
+                            #endif
                             return;
                         }
-                        
-                        // Find team score labels - search for labels that might be team scores
-                        var allLabels = scoreboardContainer.Query<Label>().ToList();
-                        
-                        Label blueScoreLabel = null;
-                        Label redScoreLabel = null;
-                
-                // Try to find team score labels by name - check for exact matches first
-                foreach (var label in allLabels) {
-                    string labelName = label.name?.ToLower() ?? "";
-                    string labelText = label.text ?? "";
-                    
-                    // Exact name match (most reliable)
-                    if (labelName == "bluescore" && blueScoreLabel == null) {
-                        blueScoreLabel = label;
-                    } else if (labelName == "redscore" && redScoreLabel == null) {
-                        redScoreLabel = label;
-                    }
-                    // Fallback: contains "blue" or "red" and "score"
-                    else if (labelName.Contains("blue") && labelName.Contains("score") && blueScoreLabel == null) {
-                        blueScoreLabel = label;
-                    } else if (labelName.Contains("red") && labelName.Contains("score") && redScoreLabel == null) {
-                        redScoreLabel = label;
-                    }
-                }
-                
-                // If not found by name, try to find by position (team scores are usually at the top, numeric)
-                if (blueScoreLabel == null || redScoreLabel == null) {
-                    var topLabels = allLabels.Where(l => {
-                        if (l.text == null || l.text.Length == 0) return false;
-                        
-                        // Exclude labels we know are NOT team scores
-                        string labelName = l.name?.ToLower() ?? "";
-                        if (labelName.Contains("ping") || labelName.Contains("sog") || labelName.Contains("tooltip") || 
-                            labelName.Contains("players") || labelName.Contains("position") || labelName.Contains("username") ||
-                            labelName.Contains("goals") || labelName.Contains("assists") || labelName.Contains("points")) {
-                            return false;
-                        }
-                        
-                        var layout = l.layout;
-                        bool isNumeric = l.text.All(c => char.IsDigit(c) || c == '-');
-                        // Look for numeric labels at the very top (y < 50) - team scores are usually there
-                        return isNumeric && layout.y >= 0 && layout.y < 50;
-                    }).OrderBy(l => l.layout.x).ToList(); // Order by X position (left to right)
-                    
-                    if (topLabels.Count >= 2) {
-                        // Leftmost is blue, rightmost is red
-                        if (blueScoreLabel == null) {
-                            blueScoreLabel = topLabels[0]; // Leftmost
-                        }
-                        if (redScoreLabel == null) {
-                            redScoreLabel = topLabels[topLabels.Count - 1]; // Rightmost
-                        }
-                    } else if (topLabels.Count == 1) {
-                        // Only one found - use X position relative to parent center to determine team
-                        var layout = topLabels[0].layout;
-                        var parentLayout = topLabels[0].parent?.layout ?? new Rect();
-                        float centerX = parentLayout.width > 0 ? parentLayout.width / 2 : 0;
-                        
-                        if (blueScoreLabel == null && layout.x < centerX) {
-                            blueScoreLabel = topLabels[0];
-                        } else if (redScoreLabel == null && layout.x >= centerX) {
-                            redScoreLabel = topLabels[0];
-                        }
-                    }
-                }
-                
-                // If still not found, try searching all UI documents (team scores might be in main game UI, not scoreboard)
-                if (blueScoreLabel == null || redScoreLabel == null) {
-                    try {
-                        // Search all UIDocument components in the scene
-                        var allUIDocuments = UnityEngine.Object.FindObjectsByType<UnityEngine.UIElements.UIDocument>(UnityEngine.FindObjectsSortMode.None);
-                        
-                        foreach (var uiDoc in allUIDocuments) {
-                            if (uiDoc?.rootVisualElement == null) continue;
-                            
-                            var rootLabels = uiDoc.rootVisualElement.Query<Label>().ToList();
-                            
-                            // First, try to find by exact name match (case-insensitive)
-                            foreach (var label in rootLabels) {
-                                string labelName = label.name?.ToLower() ?? "";
-                                if (labelName == "bluescore" && blueScoreLabel == null) {
-                                    blueScoreLabel = label;
-                                } else if (labelName == "redscore" && redScoreLabel == null) {
-                                    redScoreLabel = label;
-                                }
-                            }
-                            
-                            // If still not found, look for team score labels by position
-                            if (blueScoreLabel == null || redScoreLabel == null) {
-                                var potentialScores = rootLabels.Where(l => {
-                                    if (l.text == null || l.text.Length == 0) return false;
-                                    string labelName = l.name?.ToLower() ?? "";
-                                    // Exclude known non-score labels
-                                    if (labelName.Contains("ping") || labelName.Contains("sog") || labelName.Contains("tooltip") || 
-                                        labelName.Contains("players") || labelName.Contains("position") || labelName.Contains("username") ||
-                                        labelName.Contains("goals") || labelName.Contains("assists") || labelName.Contains("points") ||
-                                        labelName.Contains("title") || labelName.Contains("name")) {
-                                        return false;
-                                    }
-                                    
-                                    bool isNumeric = l.text.All(c => char.IsDigit(c) || c == '-');
-                                    var layout = l.layout;
-                                    // Team scores are usually at the top and reasonably sized
-                                    return isNumeric && layout.y >= 0 && layout.y < 200 && layout.height > 10;
-                                }).OrderBy(l => l.layout.x).ToList(); // Order by X position (left to right)
-                                
-                                if (potentialScores.Count >= 2) {
-                                    // Leftmost label is blue, rightmost is red
-                                    if (blueScoreLabel == null) {
-                                        blueScoreLabel = potentialScores[0]; // Leftmost
-                                    }
-                                    if (redScoreLabel == null) {
-                                        redScoreLabel = potentialScores[potentialScores.Count - 1]; // Rightmost
-                                    }
-                                } else if (potentialScores.Count == 1) {
-                                    // Only one found - use X position to determine team
-                                    var layout = potentialScores[0].layout;
-                                    var parentLayout = potentialScores[0].parent?.layout ?? new Rect();
-                                    float centerX = parentLayout.width > 0 ? parentLayout.width / 2 : 0;
-                                    
-                                    if (blueScoreLabel == null && layout.x < centerX) {
-                                        blueScoreLabel = potentialScores[0];
-                                    } else if (redScoreLabel == null && layout.x >= centerX) {
-                                        redScoreLabel = potentialScores[0];
-                                    }
-                                }
-                            }
-                            
-                            // If we found both, stop searching
-                            if (blueScoreLabel != null && redScoreLabel != null) break;
-                        }
-                    } catch (Exception ex) {
-                        Logging.LogError($"Error searching all UI documents: {ex}", _clientConfig);
-                    }
-                }
-                
-                        if (blueScoreLabel != null) {
-                            blueScoreLabel.pickingMode = PickingMode.Position;
-                            SetupTeamTooltip(blueScoreLabel, PlayerTeam.Blue, blueScoreLabel);
-                        }
-                        
-                        if (redScoreLabel != null) {
-                            redScoreLabel.pickingMode = PickingMode.Position;
-                            SetupTeamTooltip(redScoreLabel, PlayerTeam.Red, redScoreLabel);
-                        }
-                        
-                        // Mark tooltips as set up to prevent repeated calls
+
+                        // Create transparent hit areas in scoreboardContainer so mouse events are
+                        // received by the UIScoreboard panel (which sits on top of UIGameState).
+                        VisualElement blueHitArea = CreateTeamScoreHitArea(scoreboardContainer, blueScoreLabel, PlayerTeam.Blue);
+                        VisualElement redHitArea  = CreateTeamScoreHitArea(scoreboardContainer, redScoreLabel,  PlayerTeam.Red);
+
+                        SetupTeamTooltip(blueHitArea, blueScoreLabel, scoreboardContainer, PlayerTeam.Blue);
+                        SetupTeamTooltip(redHitArea,  redScoreLabel,  scoreboardContainer, PlayerTeam.Red);
+
                         _teamTooltipsSetup = true;
+                        #if DEBUG_MODE
+                        DebugTrace.Write("TeamSetup", $"Team tooltips registered successfully (hit-area approach).");
+                        #endif
+
+                        // Keep hit-area positions in sync with the score labels continuously.
+                        // RefreshTeamHitAreaPositions is also called from ScoreboardModifications, but that
+                        // only fires when player stat updates arrive. After game-end, stats stop flowing so
+                        // we need this independent loop to keep tooltips working during the post-game period.
+                        void KeepHitAreasAligned() {
+                            // Stop looping once tooltips have been torn down (new game reset).
+                            if (_teamHitAreas.Count == 0 || !_teamTooltipsSetup)
+                                return;
+                            RefreshTeamHitAreaPositions(scoreboardContainer);
+                            scoreboardContainer.schedule.Execute(KeepHitAreasAligned).ExecuteLater(500);
+                        }
+                        scoreboardContainer.schedule.Execute(KeepHitAreasAligned).ExecuteLater(500);
                     } catch (Exception ex) {
-                        Logging.LogError($"Error in scheduled SetupTeamTooltips: {ex}", _clientConfig);
+                        #if DEBUG_MODE
+                        DebugTrace.Write("TeamSetup", $"Exception in scheduled callback: {ex}");
+                        #endif
+                    } finally {
+                        _teamTooltipSetupScheduled = false;
                     }
-                }).ExecuteLater(500); // Wait 500ms for UI to fully load
+                }).ExecuteLater(600);
             } catch (Exception ex) {
                 Logging.LogError($"Error setting up team tooltips: {ex}", _clientConfig);
             }
         }
 
         /// <summary>
-        /// Sets up a tooltip that appears when hovering over a team score.
+        /// Creates a transparent VisualElement in scoreboardContainer that covers the given score label's
+        /// screen area, giving us a reliable hit target in the UIScoreboard panel.
         /// </summary>
-        private static void SetupTeamTooltip(Label scoreLabel, PlayerTeam team, Label referenceLabel) {
+        private static VisualElement CreateTeamScoreHitArea(VisualElement scoreboardContainer, Label scoreLabel, PlayerTeam team) {
+            // Remove stale hit area if any
+            if (_teamHitAreas.TryGetValue(team, out VisualElement stale)) {
+                stale.parent?.Remove(stale);
+                _teamHitAreas.Remove(team);
+            }
+
+            VisualElement hitArea = new VisualElement {
+                name = $"TeamScoreHitArea_{team}",
+                pickingMode = PickingMode.Position
+            };
+            hitArea.style.position   = Position.Absolute;
+            hitArea.style.backgroundColor = new StyleColor(Color.clear);
+            scoreboardContainer.Add(hitArea);
+            scoreboardContainer.style.overflow = Overflow.Visible;
+
+            // Scheduled so layout is resolved before we read worldBound
+            hitArea.schedule.Execute(() => {
+                Rect labelWorld     = scoreLabel.worldBound;
+                Rect containerWorld = scoreboardContainer.worldBound;
+                if (labelWorld.width > 0 && containerWorld.width > 0) {
+                    hitArea.style.left   = labelWorld.x      - containerWorld.x;
+                    hitArea.style.top    = labelWorld.y      - containerWorld.y;
+                    hitArea.style.width  = Mathf.Max(labelWorld.width,  50f);
+                    hitArea.style.height = Mathf.Max(labelWorld.height, 30f);
+                    #if DEBUG_MODE
+                    DebugTrace.Write("TeamSetup", $"HitArea {team}: label world={labelWorld} container world={containerWorld} ? local left={hitArea.style.left.value} top={hitArea.style.top.value} w={hitArea.style.width.value} h={hitArea.style.height.value}");
+                    #endif
+                }
+            }).ExecuteLater(100);
+
+            _teamHitAreas.Add(team, hitArea);
+            return hitArea;
+        }
+
+        /// <summary>
+        /// Sets up a tooltip that appears when hovering over a team score hit area.
+        /// hitArea is a transparent overlay inside scoreboardContainer (UIScoreboard panel).
+        /// scoreLabel is the actual label in UIGameState, used only for reference/font.
+        /// </summary>
+        private static void SetupTeamTooltip(VisualElement hitArea, Label scoreLabel, VisualElement scoreboardContainer, PlayerTeam team) {
+            Label referenceLabel = scoreLabel;
             string teamName = team == PlayerTeam.Blue ? "Blue Team" : "Red Team";
             string teamKey = team.ToString();
             
-            // Remove existing tooltip if it exists (same pattern as player tooltips)
+            // Remove existing tooltip if it exists
             if (_teamTooltips.TryGetValue(team, out VisualElement existingTooltip)) {
                 existingTooltip.parent?.Remove(existingTooltip);
                 _teamTooltips.Remove(team);
@@ -6996,35 +7669,28 @@ namespace oomtm450PuckMod_Stats {
             CreateTeamStatLabel(tooltip, "OZ Entries", "TooltipTeamOZEntries_" + teamKey, referenceLabel, defaultFontSize);
             CreateTeamStatLabel(tooltip, "Possession", "TooltipTeamPossession_" + teamKey, referenceLabel, defaultFontSize);
             
-            // Add tooltip to the scoreLabel's parent container (where the team scores are displayed)
-            // Using BringToFront() to ensure it appears above scoreboard elements
-            VisualElement parentContainer = scoreLabel.parent;
-            if (parentContainer != null) {
-                parentContainer.Add(tooltip);
-                parentContainer.style.overflow = Overflow.Visible;
-            } else {
-                // Fallback to scoreboard container if parent is not available
-                VisualElement scoreboardContainer = SystemFunc.GetPrivateField<VisualElement>(typeof(UIScoreboard), UIScoreboard.Instance, "container");
-                if (scoreboardContainer != null) {
-                    scoreboardContainer.Add(tooltip);
-                    scoreboardContainer.style.overflow = Overflow.Visible;
-                }
-            }
+            // Add tooltip to scoreboardContainer (UIScoreboard panel) ? same panel as hit areas
+            // and player tooltips so it renders correctly above everything.
+            scoreboardContainer.Add(tooltip);
+            scoreboardContainer.style.overflow = Overflow.Visible;
             
             _teamTooltips.Add(team, tooltip);
-            
-            // Mouse event handlers
+
+            #if DEBUG_MODE
+            DebugTrace.Write("TeamTooltip", $"SetupTeamTooltip done for team={team} hitArea={hitArea?.name} scoreboardContainer={scoreboardContainer?.name}");
+            #endif
+
             Action showTooltip = () => {
-                // Only show tooltip if server has the stats mod
-                if (!_serverHasResponded) {
-                    return;
-                }
+                #if DEBUG_MODE
+                DebugTrace.Write("TeamHover", $"HOVER FIRED for team={team} serverHasResponded={_serverHasResponded}");
+                #endif
+                if (!_serverHasResponded) return;
                 UpdateTeamTooltipStats(tooltip, team);
                 tooltip.style.display = DisplayStyle.Flex;
-                // Ensure tooltip is brought to front to appear above scoreboard elements
                 tooltip.BringToFront();
-                UpdateTeamTooltipPosition(tooltip, scoreLabel, team);
-                
+                // Anchor to the hit area's fixed position, not the cursor.
+                UpdateTeamTooltipPositionAtHitArea(tooltip, scoreboardContainer, hitArea, team);
+
                 void UpdatePeriodically() {
                     if (tooltip.style.display == DisplayStyle.Flex) {
                         UpdateTeamTooltipStats(tooltip, team);
@@ -7033,25 +7699,15 @@ namespace oomtm450PuckMod_Stats {
                 }
                 tooltip.schedule.Execute(UpdatePeriodically).ExecuteLater(500);
             };
-            
+
             Action hideTooltip = () => {
                 tooltip.style.display = DisplayStyle.None;
             };
-            
-            scoreLabel.RegisterCallback<MouseEnterEvent>(evt => showTooltip());
-            scoreLabel.RegisterCallback<PointerEnterEvent>(evt => showTooltip());
-            scoreLabel.RegisterCallback<MouseLeaveEvent>(evt => hideTooltip());
-            scoreLabel.RegisterCallback<PointerLeaveEvent>(evt => hideTooltip());
-            
-            scoreLabel.RegisterCallback<MouseMoveEvent>(evt => {
-                if (tooltip.style.display == DisplayStyle.Flex) {
-                    float currentTime = UnityEngine.Time.time;
-                    if (!_tooltipMoveTimes.ContainsKey(tooltip) || currentTime - _tooltipMoveTimes[tooltip] > 0.1f) {
-                        _tooltipMoveTimes[tooltip] = currentTime;
-                        UpdateTeamTooltipPosition(tooltip, scoreLabel, team);
-                    }
-                }
-            });
+
+            hitArea.RegisterCallback<MouseEnterEvent>(evt => showTooltip());
+            hitArea.RegisterCallback<PointerEnterEvent>(evt => showTooltip());
+            hitArea.RegisterCallback<MouseLeaveEvent>(evt => hideTooltip());
+            hitArea.RegisterCallback<PointerLeaveEvent>(evt => hideTooltip());
         }
 
         private static void CreateTeamStatLabel(VisualElement tooltip, string labelText, string labelName, Label referenceLabel, float defaultFontSize) {
@@ -7176,67 +7832,44 @@ namespace oomtm450PuckMod_Stats {
         }
 
         /// <summary>
-        /// Updates the team tooltip position relative to the score label.
+        /// Positions a team tooltip anchored to the cursor world position.
+        /// Blue:  right edge at cursor ? extends LEFT  of cursor.
+        /// Red:   left  edge at cursor ? extends RIGHT of cursor.
+        /// Both appear just below the cursor.
         /// </summary>
-        private static void UpdateTeamTooltipPosition(VisualElement tooltip, Label scoreLabel, PlayerTeam team) {
+        /// <summary>
+        /// Positions the team tooltip at a fixed location relative to the score hit area,
+        /// regardless of where the mouse entered. Blue tooltip appears to the left of the
+        /// label, red tooltip appears to the right.
+        /// </summary>
+        private static void UpdateTeamTooltipPositionAtHitArea(VisualElement tooltip, VisualElement scoreboardContainer, VisualElement hitArea, PlayerTeam team) {
             try {
-                VisualElement parent = tooltip.parent;
-                if (parent == null) {
-                    return;
-                }
-                
-                // Get the label's position in world space, then convert to parent's local space
-                Rect labelLayout = scoreLabel.layout;
-                Rect parentLayout = parent.layout;
-                
-                // Get tooltip dimensions
-                float tooltipWidth = tooltip.resolvedStyle.width > 0 ? tooltip.resolvedStyle.width : 280;
-                float tooltipHeight = tooltip.resolvedStyle.height > 0 ? tooltip.resolvedStyle.height : 200;
-                
-                float xPos;
-                float yPos = labelLayout.y;
-                
-                // Blue team: position to the left of the label by default
-                // Red team: position to the right of the label by default
-                if (team == PlayerTeam.Blue) {
-                    // Position to the left of the label
-                    xPos = labelLayout.x - tooltipWidth - 10;
-                    
-                    // Check if tooltip would go off the left edge
-                    if (xPos < 0) {
-                        xPos = labelLayout.x + labelLayout.width + 10; // Fallback to right side
-                    }
-                } else {
-                    // Position to the right of the label (Red team)
-                    xPos = labelLayout.x + labelLayout.width + 10;
-                    
-                    // Check if tooltip would go off the right edge
-                    if (xPos + tooltipWidth > parentLayout.width) {
-                        xPos = labelLayout.x - tooltipWidth - 10; // Fallback to left side
-                    }
-                }
-                
-                // Check if tooltip would go off the left edge (for both teams after fallback)
-                if (xPos < 0) {
-                    xPos = labelLayout.x + (labelLayout.width / 2) - (tooltipWidth / 2); // Center as last resort
-                }
-                
-                // Check if tooltip would go off the bottom edge
-                if (yPos + tooltipHeight > parentLayout.height) {
-                    yPos = parentLayout.height - tooltipHeight - 10;
-                }
-                
-                // Ensure minimum margins
-                if (xPos < 10) xPos = 10;
-                if (yPos < 10) yPos = 10;
-                
-                tooltip.style.left = xPos;
-                tooltip.style.top = yPos;
-                
-                // Ensure tooltip maintains highest priority when repositioned
+                Rect parentWorld = scoreboardContainer.worldBound;
+                if (parentWorld.width <= 0) return;
+
+                Rect hitWorld = hitArea.worldBound;
+                if (hitWorld.width <= 0) return;
+
+                // Width is always the explicit fixed value set on creation — don't use resolvedStyle
+                // which may be unresolved immediately after DisplayStyle.Flex is set.
+                const float tooltipWidth = 280f;
+
+                // Blue: top-right corner of tooltip anchored at hit area right edge → tooltip grows left
+                // Red:  top-left  corner of tooltip anchored at hit area left  edge → tooltip grows right
+                float xScreen = team == PlayerTeam.Blue
+                    ? hitWorld.xMax - tooltipWidth
+                    : hitWorld.xMin;
+                float yScreen = hitWorld.yMax + 8f;
+
+                tooltip.style.left = xScreen - parentWorld.x;
+                tooltip.style.top  = yScreen - parentWorld.y;
                 tooltip.BringToFront();
+
+                #if DEBUG_MODE
+                DebugTrace.Write("TeamTooltipPos", $"team={team} hitArea={hitWorld} local=({tooltip.style.left.value.value:F0},{tooltip.style.top.value.value:F0})");
+                #endif
             } catch (Exception ex) {
-                Logging.LogError($"Error updating team tooltip position: {ex}", _clientConfig);
+                Logging.LogError($"Error positioning team tooltip: {ex}", _clientConfig);
             }
         }
 
@@ -7245,54 +7878,48 @@ namespace oomtm450PuckMod_Stats {
         /// </summary>
         private static void UpdateTooltipPosition(VisualElement tooltip, Label nameLabel) {
             try {
-                // Get the parent container (scoreboard container)
                 VisualElement parent = tooltip.parent;
-                if (parent == null) {
-                    Logging.LogError("Tooltip has no parent container", _clientConfig);
-                    return;
-                }
+                if (parent == null) return;
 
-                // Get label position relative to parent
-                Rect labelLayout = nameLabel.layout;
-                Rect parentLayout = parent.layout;
-                Rect tooltipLayout = tooltip.layout;
-                
-                if (labelLayout.width > 0 && labelLayout.height > 0) {
-                    // Position tooltip to the right of the label
-                    float xPos = labelLayout.xMax + 10;
-                    float yPos = labelLayout.yMin;
-                    
-                    // Check if tooltip would go off the right edge of parent
-                    float tooltipWidth = tooltipLayout.width > 0 ? tooltipLayout.width : 280;
-                    if (xPos + tooltipWidth > parentLayout.width) {
-                        // Position to the left of the label instead
-                        xPos = labelLayout.xMin - tooltipWidth - 10;
-                    }
-                    
-                    // Check if tooltip would go off the bottom edge
-                    float tooltipHeight = tooltipLayout.height > 0 ? tooltipLayout.height : 150;
-                    if (yPos + tooltipHeight > parentLayout.height) {
-                        // Adjust upward
-                        yPos = parentLayout.height - tooltipHeight - 5;
-                    }
-                    
-                    // Ensure tooltip doesn't go off the top edge
-                    if (yPos < 0) {
-                        yPos = 5;
-                    }
-                    
-                    // Ensure tooltip doesn't go off the left edge
-                    if (xPos < 0) {
-                        xPos = 5;
-                    }
-                    
-                    tooltip.style.left = xPos;
-                    tooltip.style.top = yPos;
-                    
-                    Logging.Log($"Tooltip positioned at ({xPos}, {yPos}) relative to parent. Label layout: ({labelLayout.x}, {labelLayout.y}) size {labelLayout.width}x{labelLayout.height}, Parent size: {parentLayout.width}x{parentLayout.height}", _clientConfig, true);
-                } else {
-                    Logging.LogError($"Label layout is invalid: {labelLayout}", _clientConfig);
-                }
+                // Use worldBound so we are independent of intermediate coordinate spaces.
+                // nameLabel may be nested several elements deep inside the scoreboardContainer,
+                // so layout-space coordinates would require manual accumulation. worldBound
+                // gives us real screen pixels and is always correct regardless of nesting.
+                Rect nameWorld   = nameLabel.worldBound;
+                Rect parentWorld = parent.worldBound;
+
+                // Guard: layout not yet computed
+                if (parentWorld.width <= 0) return;
+
+                float tooltipWidth  = tooltip.resolvedStyle.width  > 1 ? tooltip.resolvedStyle.width  : 280f;
+                float tooltipHeight = tooltip.resolvedStyle.height > 1 ? tooltip.resolvedStyle.height : 200f;
+
+                // Horizontal: place to the right of the scoreboard panel with a small gap.
+                // We use the parent (scoreboardContainer) right edge as the anchor so it
+                // sits consistently next to the PING column on every screen resolution.
+                float xScreen = parentWorld.xMax + 12f;
+
+                // If that would go off the screen's right side, flip it to the left of the panel.
+                // We compare against the parent's own parent width as a proxy for screen width.
+                float screenW = parent.parent != null && parent.parent.worldBound.width > 0
+                    ? parent.parent.worldBound.xMax
+                    : xScreen + tooltipWidth + 20f;  // safe fallback ? won't flip
+                if (xScreen + tooltipWidth > screenW - 8f)
+                    xScreen = parentWorld.xMin - tooltipWidth - 12f;
+
+                // Vertical: center the tooltip relative to the scoreboard panel.
+                float yScreen = parentWorld.yMin + (parentWorld.height / 2f) - (tooltipHeight / 2f);
+
+                // Convert from screen space back to scoreboardContainer local space.
+                float xLocal = xScreen - parentWorld.x;
+                float yLocal = yScreen - parentWorld.y;
+
+                tooltip.style.left = xLocal;
+                tooltip.style.top  = yLocal;
+
+                #if DEBUG_MODE
+                DebugTrace.Write("TooltipPos", $"screen=({xScreen:F0},{yScreen:F0}) local=({xLocal:F0},{yLocal:F0}) parentWorld={parentWorld} nameWorld={nameWorld}");
+                #endif
             } catch (Exception ex) {
                 Logging.LogError($"Error updating tooltip position: {ex}", _clientConfig);
             }
@@ -7306,8 +7933,8 @@ namespace oomtm450PuckMod_Stats {
         private static bool SendSOGDuringGoal(Player player) {
             ResetPuckWasSavedOrBlockedChecks();
 
-            if (!_lastShotWasCounted[player.Team.Value]) {
-                string playerSteamId = player.SteamId.Value.ToString();
+            if (!_lastShotWasCounted[player.Team]) {
+                string playerSteamId = player.SteamId.Value.Value;
 
                 if (string.IsNullOrEmpty(playerSteamId))
                     return true;
@@ -7321,12 +7948,12 @@ namespace oomtm450PuckMod_Stats {
                 LogSOG(playerSteamId, sog);
                 
                                 // Track team stat
-                                if (!_teamShots.TryGetValue(player.Team.Value, out int _))
-                                    _teamShots.Add(player.Team.Value, 0);
-                _teamShots[player.Team.Value] += 1;
-                QueueStatUpdate(Codebase.Constants.TEAM_SHOTS + player.Team.Value.ToString(), _teamShots[player.Team.Value].ToString());
+                                if (!_teamShots.TryGetValue(player.Team, out int _))
+                                    _teamShots.Add(player.Team, 0);
+                _teamShots[player.Team] += 1;
+                QueueStatUpdate(Codebase.Constants.TEAM_SHOTS + player.Team.ToString(), _teamShots[player.Team].ToString());
 
-                _lastShotWasCounted[player.Team.Value] = true;
+                _lastShotWasCounted[player.Team] = true;
 
                 // Ensure shot was recorded before recording goal (retroactively if needed)
                 float currentGameTime = GetCurrentGameTime();
@@ -7347,7 +7974,7 @@ namespace oomtm450PuckMod_Stats {
                 
                 if (!shotRecorded) {
                     // Record shot retroactively - use goal scorer's last touch position, not puck position
-                    PlayerTeam attackingTeam = player.Team.Value;
+                    PlayerTeam attackingTeam = player.Team;
                     
                     // Find the last touch event for this goal scorer (within last 12 seconds)
                     var lastTouchEvent = _playByPlayEvents.LastOrDefault(e => 
@@ -7384,7 +8011,7 @@ namespace oomtm450PuckMod_Stats {
                     }
                     
                     // Determine flag based on position (only if position is valid)
-                    string shotFlag = (shotPosition != Vector3.zero) ? DetermineShotFlag(shotPosition, player.Team.Value) : "";
+                    string shotFlag = (shotPosition != Vector3.zero) ? DetermineShotFlag(shotPosition, player.Team) : "";
                     
                     // If there's an existing shot attempt event, update it to "goal" instead of creating a new one
                     if (existingShotAttempt != null) {
@@ -7420,10 +8047,10 @@ namespace oomtm450PuckMod_Stats {
                         QueueStatUpdate(Codebase.Constants.SHOT_ATTEMPTS + playerSteamId, _shotAttempts[playerSteamId].ToString());
                         
                         // Track team shot attempts
-                        if (!_teamShotAttempts.TryGetValue(player.Team.Value, out int _))
-                            _teamShotAttempts.Add(player.Team.Value, 0);
-                        _teamShotAttempts[player.Team.Value] += 1;
-                        QueueStatUpdate(Codebase.Constants.TEAM_SHOT_ATTEMPTS + player.Team.Value.ToString(), _teamShotAttempts[player.Team.Value].ToString());
+                        if (!_teamShotAttempts.TryGetValue(player.Team, out int _))
+                            _teamShotAttempts.Add(player.Team, 0);
+                        _teamShotAttempts[player.Team] += 1;
+                        QueueStatUpdate(Codebase.Constants.TEAM_SHOT_ATTEMPTS + player.Team.ToString(), _teamShotAttempts[player.Team].ToString());
                     }
                     
                     // Track home plate SOGs for retroactive shots (if shot was from home plate and touch was found)
@@ -7436,17 +8063,17 @@ namespace oomtm450PuckMod_Stats {
                         QueueStatUpdate(Codebase.Constants.HOME_PLATE_SOGS + playerSteamId, _homePlateSogs[playerSteamId].ToString());
                         
                         // Track team home plate SOGs
-                        if (!_teamHomePlateSogs.TryGetValue(player.Team.Value, out int _))
-                            _teamHomePlateSogs.Add(player.Team.Value, 0);
-                        _teamHomePlateSogs[player.Team.Value] += 1;
-                        QueueStatUpdate(Codebase.Constants.TEAM_HOME_PLATE_SOGS + player.Team.Value.ToString(), _teamHomePlateSogs[player.Team.Value].ToString());
+                        if (!_teamHomePlateSogs.TryGetValue(player.Team, out int _))
+                            _teamHomePlateSogs.Add(player.Team, 0);
+                        _teamHomePlateSogs[player.Team] += 1;
+                        QueueStatUpdate(Codebase.Constants.TEAM_HOME_PLATE_SOGS + player.Team.ToString(), _teamHomePlateSogs[player.Team].ToString());
                         homePlateTracked = true;
                     }
                     
                     // Also check pending release info if touch event didn't have home plate flag
                     if (!homePlateTracked) {
                         if (_pendingShotReleases.TryGetValue(attackingTeam, out var releaseInfo) && !string.IsNullOrEmpty(releaseInfo.ShooterSteamId) && releaseInfo.ShooterSteamId == playerSteamId) {
-                            string releaseShotFlag = DetermineShotFlag(releaseInfo.PuckPosition, player.Team.Value);
+                            string releaseShotFlag = DetermineShotFlag(releaseInfo.PuckPosition, player.Team);
                             if (releaseShotFlag == "HomePlate") {
                                 if (!_homePlateSogs.TryGetValue(playerSteamId, out int _))
                                     _homePlateSogs.Add(playerSteamId, 0);
@@ -7454,10 +8081,10 @@ namespace oomtm450PuckMod_Stats {
                                 QueueStatUpdate(Codebase.Constants.HOME_PLATE_SOGS + playerSteamId, _homePlateSogs[playerSteamId].ToString());
                                 
                                 // Track team home plate SOGs
-                                if (!_teamHomePlateSogs.TryGetValue(player.Team.Value, out int _))
-                                    _teamHomePlateSogs.Add(player.Team.Value, 0);
-                                _teamHomePlateSogs[player.Team.Value] += 1;
-                                QueueStatUpdate(Codebase.Constants.TEAM_HOME_PLATE_SOGS + player.Team.Value.ToString(), _teamHomePlateSogs[player.Team.Value].ToString());
+                                if (!_teamHomePlateSogs.TryGetValue(player.Team, out int _))
+                                    _teamHomePlateSogs.Add(player.Team, 0);
+                                _teamHomePlateSogs[player.Team] += 1;
+                                QueueStatUpdate(Codebase.Constants.TEAM_HOME_PLATE_SOGS + player.Team.ToString(), _teamHomePlateSogs[player.Team].ToString());
                             }
                         }
                     }
@@ -7495,18 +8122,18 @@ namespace oomtm450PuckMod_Stats {
                             QueueStatUpdate(Codebase.Constants.HOME_PLATE_SOGS + playerSteamId, _homePlateSogs[playerSteamId].ToString());
                             
                             // Track team home plate SOGs
-                            if (!_teamHomePlateSogs.TryGetValue(player.Team.Value, out int _))
-                                _teamHomePlateSogs.Add(player.Team.Value, 0);
-                            _teamHomePlateSogs[player.Team.Value] += 1;
-                            QueueStatUpdate(Codebase.Constants.TEAM_HOME_PLATE_SOGS + player.Team.Value.ToString(), _teamHomePlateSogs[player.Team.Value].ToString());
+                            if (!_teamHomePlateSogs.TryGetValue(player.Team, out int _))
+                                _teamHomePlateSogs.Add(player.Team, 0);
+                            _teamHomePlateSogs[player.Team] += 1;
+                            QueueStatUpdate(Codebase.Constants.TEAM_HOME_PLATE_SOGS + player.Team.ToString(), _teamHomePlateSogs[player.Team].ToString());
                         }
                     }
                 }
 
                 // Track home plate shots for goalie when goal is scored on home plate shot
-                Player goalie = PlayerFunc.GetOtherTeamGoalie(player.Team.Value);
+                Player goalie = PlayerFunc.GetOtherTeamGoalie(player.Team);
                 if (goalie != null) {
-                    string goalieSteamId = goalie.SteamId.Value.ToString();
+                    string goalieSteamId = goalie.SteamId.Value.Value;
                     bool isHomePlateGoal = false;
                     
                     // Check if the shot was a home plate shot
@@ -7523,11 +8150,11 @@ namespace oomtm450PuckMod_Stats {
                         }
                     } else if (!shotRecorded) {
                         // Check pending shot release (if shot event doesn't exist yet)
-                        PlayerTeam attackingTeam = player.Team.Value;
+                        PlayerTeam attackingTeam = player.Team;
                         if (_pendingShotReleases.TryGetValue(attackingTeam, out var releaseInfo) && 
                             !string.IsNullOrEmpty(releaseInfo.ShooterSteamId) && 
                             releaseInfo.ShooterSteamId == playerSteamId) {
-                            string shotFlag = DetermineShotFlag(releaseInfo.PuckPosition, player.Team.Value);
+                            string shotFlag = DetermineShotFlag(releaseInfo.PuckPosition, player.Team);
                             if (shotFlag == "HomePlate") {
                                 isHomePlateGoal = true;
                             }
@@ -7545,24 +8172,14 @@ namespace oomtm450PuckMod_Stats {
                     }
                 }
 
-                // Record Goal event (separate from shot)
-                Puck goalPuck2 = PuckManager.Instance?.GetPuck();
-                if (player != null && player && goalPuck2 != null) {
-                    Vector3 puckPos = goalPuck2.transform.position;
-                    Vector3 puckVel = goalPuck2.GetComponent<Rigidbody>()?.linearVelocity ?? Vector3.zero;
-                    RecordPlayByPlayEventInternal(PlayByPlayEventType.Goal, player, puckPos, puckVel, "successful");
-                }
-
+                // Goal PBP event recording is handled exclusively by the Harmony Postfix
+                // (GameManager_Server_GoalScored_Patch.Postfix) which has proper dedup logic.
+                // Recording it here as well (before the Postfix runs) produced triple Goal PBP
+                // entries per real goal, inflating plus/minus by 3× and corrupting per-game CSVs.
                 return false;
             }
             else {
-                // Shot was already counted, but still record Goal event
-                Puck goalPuck3 = PuckManager.Instance?.GetPuck();
-                if (player != null && player && goalPuck3 != null) {
-                    Vector3 puckPos = goalPuck3.transform.position;
-                    Vector3 puckVel = goalPuck3.GetComponent<Rigidbody>()?.linearVelocity ?? Vector3.zero;
-                    RecordPlayByPlayEventInternal(PlayByPlayEventType.Goal, player, puckPos, puckVel, "successful");
-                }
+                // Shot already counted — Goal PBP event is handled by the Harmony Postfix.
             }
 
             return true;
@@ -7579,17 +8196,166 @@ namespace oomtm450PuckMod_Stats {
         }
 
         /// <summary>
+        /// Who was in net for the defending team when this goal was scored (from live role + PBP roster snapshot).
+        /// Empty net goals return isEmptyNet=true and no goalie steam id.
+        /// </summary>
+        private static (string goalieSteamId, bool isEmptyNet) ResolveDefendingGoalieForGoal(PlayByPlayEvent goalPbp, PlayerTeam scoringTeam) {
+            Player defendingGoalie = PlayerFunc.GetOtherTeamGoalie(scoringTeam);
+            string roleGoalieId = defendingGoalie != null && defendingGoalie ? defendingGoalie.SteamId.Value.Value : "";
+
+            string rosterGoalieId = "";
+            if (goalPbp != null) {
+                var rosterIds = ExtractSteamIdsFromRosterField(goalPbp.OpposingTeamGoalieSteamID);
+                if (rosterIds.Count > 0)
+                    rosterGoalieId = rosterIds.First();
+            }
+
+            if (string.IsNullOrEmpty(roleGoalieId) && string.IsNullOrEmpty(rosterGoalieId))
+                return ("", true);
+
+            if (!string.IsNullOrEmpty(roleGoalieId))
+                return (roleGoalieId, false);
+
+            return (rosterGoalieId, false);
+        }
+
+        /// <summary>
+        /// Resolves defending goalie for a stored goal (supports legacy goals recorded before per-goalie attribution).
+        /// </summary>
+        private static string ResolveDefendingGoalieSteamIdForGoal(GoalInfo goal) {
+            if (goal == null)
+                return "";
+            if (goal.IsEmptyNet)
+                return "";
+            if (!string.IsNullOrEmpty(goal.DefendingGoalieSteamId))
+                return goal.DefendingGoalieSteamId;
+
+            PlayByPlayEvent pbpGoal = _playByPlayEvents.FirstOrDefault(e =>
+                e.EventType == PlayByPlayEventType.Goal &&
+                e.PlayerSteamId == goal.Scorer &&
+                e.Period == goal.Period &&
+                Math.Abs(e.GameTime - goal.GameTime) < 1.0f);
+
+            if (pbpGoal == null)
+                return "";
+
+            var rosterIds = ExtractSteamIdsFromRosterField(pbpGoal.OpposingTeamGoalieSteamID);
+            return rosterIds.Count > 0 ? rosterIds.First() : "";
+        }
+
+        private static bool IsGoalEmptyNet(GoalInfo goal) {
+            if (goal == null)
+                return false;
+            if (goal.IsEmptyNet)
+                return true;
+            if (!string.IsNullOrEmpty(goal.DefendingGoalieSteamId))
+                return false;
+            return string.IsNullOrEmpty(ResolveDefendingGoalieSteamIdForGoal(goal));
+        }
+
+        /// <summary>
+        /// Goals charged to a specific goalie (excludes empty-net and other goalies' stints).
+        /// </summary>
+        private static int CountGoalsAllowedForGoalie(string goalieSteamId, int additionalGoalsAllowed = 0) {
+            if (string.IsNullOrEmpty(goalieSteamId))
+                return 0;
+
+            int count = 0;
+            foreach (GoalInfo g in _goals) {
+                if (IsGoalEmptyNet(g))
+                    continue;
+                if (ResolveDefendingGoalieSteamIdForGoal(g) == goalieSteamId)
+                    count++;
+            }
+            return count + additionalGoalsAllowed;
+        }
+
+        /// <summary>
+        /// Enforces shots faced = saves + goals allowed. Fixes phantom ++shots on _savePerc
+        /// that never became a save or goal (e.g. blocked shots, legacy SOG stat triggers).
+        /// </summary>
+        /// <param name="additionalGoalsAllowed">Include a goal being scored now but not yet appended to <see cref="_goals"/>.</param>
+        private static void ReconcileGoalieShotsFaced(string goalieSteamId, int additionalGoalsAllowed = 0) {
+            if (string.IsNullOrEmpty(goalieSteamId) || !ServerFunc.IsDedicatedServer())
+                return;
+
+            int goalsAllowed = CountGoalsAllowedForGoalie(goalieSteamId, additionalGoalsAllowed);
+            if (!_savePerc.TryGetValue(goalieSteamId, out var v)) {
+                _savePerc.Add(goalieSteamId, (0, goalsAllowed));
+                QueueStatUpdate(Codebase.Constants.SAVEPERC + goalieSteamId, _savePerc[goalieSteamId].ToString());
+                return;
+            }
+
+            int canonicalShots = v.Saves + goalsAllowed;
+            if (v.Shots == canonicalShots)
+                return;
+
+            _savePerc[goalieSteamId] = (v.Saves, canonicalShots);
+            QueueStatUpdate(Codebase.Constants.SAVEPERC + goalieSteamId, _savePerc[goalieSteamId].ToString());
+            LogSavePerc(goalieSteamId, v.Saves, canonicalShots);
+        }
+
+        /// <summary>
+        /// When a shot is fully blocked (no goal), remove any goalie save/SF that was credited
+        /// for that attempt, then reconcile SF to saves + goals allowed.
+        /// </summary>
+        private static void RevertGoalieStatsForBlockedShot(PlayerTeam shooterTeam, string shooterSteamId, float blockGameTime) {
+            Player goalie = PlayerFunc.GetOtherTeamGoalie(shooterTeam);
+            if (goalie == null || !goalie)
+                return;
+
+            string goalieSteamId = goalie.SteamId.Value.Value;
+            PlayerTeam defendingTeam = goalie.Team;
+            float eventTime = blockGameTime > 0f ? blockGameTime : GetCurrentGameTime();
+
+            if (!string.IsNullOrEmpty(shooterSteamId)) {
+                var saveEvent = _playByPlayEvents.LastOrDefault(e =>
+                    e.PlayerSteamId == goalieSteamId &&
+                    e.EventType == PlayByPlayEventType.Save &&
+                    e.Outcome == "successful" &&
+                    e.GameTime >= eventTime - 4f &&
+                    e.GameTime <= eventTime + 1f);
+
+                var shotEvent = _playByPlayEvents.LastOrDefault(e =>
+                    e.PlayerSteamId == shooterSteamId &&
+                    e.EventType == PlayByPlayEventType.Shot &&
+                    e.GameTime >= eventTime - 5f &&
+                    e.GameTime <= eventTime + 1f);
+
+                if (saveEvent != null && shotEvent != null && shotEvent.Outcome == "blocked") {
+                    saveEvent.Outcome = "failed";
+                    if (_savePerc.TryGetValue(goalieSteamId, out var sp)) {
+                        int saves = Math.Max(0, sp.Saves - 1);
+                        int shots = Math.Max(0, sp.Shots - 1);
+                        _savePerc[goalieSteamId] = (saves, shots);
+                        UpdateBodyStickSavesFromPbp();
+                        QueueStatUpdate(Codebase.Constants.SAVEPERC + goalieSteamId, _savePerc[goalieSteamId].ToString());
+                    }
+                }
+            }
+
+            ReconcileGoalieShotsFaced(goalieSteamId);
+        }
+
+        /// <summary>
         /// Function that sends and sets the s% for a goalie when a goal is scored.
         /// </summary>
         /// <param name="team">PlayerTeam, team that scored the goal.</param>
         /// <param name="saveWasCounted">Bool, true if a save was already counted for that shot.</param>
         private static void SendSavePercDuringGoal(PlayerTeam team, bool saveWasCounted) {
-            // Get other team goalie.
+            // Guard: both the Harmony Prefix patch and the Event_OnStatsTrigger SOG path call this
+            // function for every goal. Without this check the second call decrements saves again,
+            // producing negative save percentages (-100 %, etc.).
+            if (_savePercDuringGoalProcessed.TryGetValue(team, out bool alreadyProcessed) && alreadyProcessed)
+                return;
+            _savePercDuringGoalProcessed[team] = true;
+
+            // Get other team goalie — null when net is empty (pulled goalie).
             Player goalie = PlayerFunc.GetOtherTeamGoalie(team);
             if (goalie == null)
                 return;
 
-            string _goaliePlayerSteamId = goalie.SteamId.Value.ToString();
+            string _goaliePlayerSteamId = goalie.SteamId.Value.Value;
             if (!_savePerc.TryGetValue(_goaliePlayerSteamId, out var _savePercValue)) {
                 _savePerc.Add(_goaliePlayerSteamId, (0, 0));
                 _savePercValue = (0, 0);
@@ -7608,7 +8374,7 @@ namespace oomtm450PuckMod_Stats {
                     .OrderByDescending(e => e.GameTime) // Most recent first
                     .FirstOrDefault();
                 
-                if (lastSaveEvent != null) {
+                    if (lastSaveEvent != null) {
                     // Check if there's a touch event by the attacking team between the save and the goal
                     bool hasFollowUpTouch = _playByPlayEvents.Any(e =>
                         e.EventType == PlayByPlayEventType.Touch &&
@@ -7617,20 +8383,21 @@ namespace oomtm450PuckMod_Stats {
                         e.GameTime < currentGameTime &&
                         e.Outcome == "successful"); // Only count successful touches
                     
+                    // A goal was scored regardless — the save is not credited.
+                    // Mark the PBP save event as "failed" in all cases (direct or rebound goal)
+                    // so that UpdateBodyStickSavesFromPbp only counts saves where no goal followed.
+                    // This keeps stick_saves + body_saves == _savePerc.Saves at all times.
+                    if (lastSaveEvent.Outcome == "successful") {
+                        lastSaveEvent.Outcome = "failed";
+                    }
+                    
+                    // Rebuild body/stick saves from PBP (excluding the now-failed save event above)
+                    UpdateBodyStickSavesFromPbp();
+                    
+                    // Decrement home plate saves only for direct goals (no rebound touch).
+                    // For rebound goals the original save-attempt didn't come from a second home-plate shot.
                     if (!hasFollowUpTouch) {
-                        // No follow-up touch by attacking team - the save didn't actually block the shot
-                        // Mark the save as "failed" since the puck went in despite the save attempt
-                        if (lastSaveEvent.Outcome == "successful") {
-                            lastSaveEvent.Outcome = "failed";
-                        }
-                        
-                        // Update body/stick saves dictionaries from pbp scanning (server-side only)
-                        UpdateBodyStickSavesFromPbp();
-                        
-                        // Check if it was a home plate save
                         bool wasHomePlateSave = lastSaveEvent.Flags != null && lastSaveEvent.Flags.Contains("HomePlate");
-                        
-                        // Decrement home plate saves if it was a home plate save
                         if (wasHomePlateSave) {
                             if (_homePlateSaves.TryGetValue(_goaliePlayerSteamId, out int hpSaveValue) && hpSaveValue > 0) {
                                 int hpSaves = _homePlateSaves[_goaliePlayerSteamId] = --hpSaveValue;
@@ -7638,13 +8405,14 @@ namespace oomtm450PuckMod_Stats {
                             }
                         }
                     }
-                    // If hasFollowUpTouch is true, the save remains "successful" (rebound goal scenario)
                 }
             }
 
-            (int saves, int sog) = _savePerc[_goaliePlayerSteamId] = saveWasCounted ? (--_savePercValue.Saves, _savePercValue.Shots) : (_savePercValue.Saves, ++_savePercValue.Shots);
+            _savePerc[_goaliePlayerSteamId] = saveWasCounted ? (--_savePercValue.Saves, _savePercValue.Shots) : (_savePercValue.Saves, ++_savePercValue.Shots);
+            // Goal is not in _goals yet (Prefix runs before Postfix) — count it when reconciling SF for this goalie only.
+            ReconcileGoalieShotsFaced(_goaliePlayerSteamId, additionalGoalsAllowed: 1);
             QueueStatUpdate(Codebase.Constants.SAVEPERC + _goaliePlayerSteamId, _savePerc[_goaliePlayerSteamId].ToString());
-            LogSavePerc(_goaliePlayerSteamId, saves, sog);
+            LogSavePerc(_goaliePlayerSteamId, _savePerc[_goaliePlayerSteamId].Saves, _savePerc[_goaliePlayerSteamId].Shots);
         }
 
         /// <summary>
@@ -7654,7 +8422,7 @@ namespace oomtm450PuckMod_Stats {
         /// <param name="saves">Int, number of saves.</param>
         /// <param name="sog">Int, number of shots on goal on the goalie.</param>
         private static void LogSavePerc(string goaliePlayerSteamId, int saves, int sog) {
-            Logging.Log($"playerSteamId:{goaliePlayerSteamId},saveperc:{GetGoalieSavePerc(saves, sog)},saves:{saves},sog:{sog}", ServerConfig);
+            Logging.Log($"playerSteamId:{goaliePlayerSteamId},saveperc:{GetGoalieSavePerc(saves, sog)},saves:{saves},sog:{sog}", ModServerConfig);
         }
 
         /// <summary>
@@ -7663,7 +8431,7 @@ namespace oomtm450PuckMod_Stats {
         /// <param name="playerSteamId">String, steam Id of the player.</param>
         /// <param name="stickSaves">Int, number of stick saves.</param>
         private static void LogStickSave(string playerSteamId, int stickSaves) {
-            Logging.Log($"playerSteamId:{playerSteamId},sticksv:{stickSaves}", ServerConfig);
+            Logging.Log($"playerSteamId:{playerSteamId},sticksv:{stickSaves}", ModServerConfig);
         }
 
         /// <summary>
@@ -7672,7 +8440,7 @@ namespace oomtm450PuckMod_Stats {
         /// <param name="playerSteamId">String, steam Id of the player.</param>
         /// <param name="sog">Int, number of shots on goal.</param>
         private static void LogSOG(string playerSteamId, int sog) {
-            Logging.Log($"playerSteamId:{playerSteamId},sog:{sog}", ServerConfig);
+            Logging.Log($"playerSteamId:{playerSteamId},sog:{sog}", ModServerConfig);
         }
 
         /// <summary>
@@ -7681,7 +8449,7 @@ namespace oomtm450PuckMod_Stats {
         /// <param name="playerSteamId">String, steam Id of the player.</param>
         /// <param name="block">Int, number of blocked shots.</param>
         private static void LogBlock(string playerSteamId, int block) {
-            Logging.Log($"playerSteamId:{playerSteamId},block:{block}", ServerConfig);
+            Logging.Log($"playerSteamId:{playerSteamId},block:{block}", ModServerConfig);
         }
 
         /// <summary>
@@ -7690,7 +8458,7 @@ namespace oomtm450PuckMod_Stats {
         /// <param name="playerSteamId">String, steam Id of the player.</param>
         /// <param name="hit">Int, number of hits.</param>
         private static void LogHit(string playerSteamId, int hit) {
-            Logging.Log($"playerSteamId:{playerSteamId},hit:{hit}", ServerConfig);
+            Logging.Log($"playerSteamId:{playerSteamId},hit:{hit}", ModServerConfig);
         }
 
         /// <summary>
@@ -7699,7 +8467,7 @@ namespace oomtm450PuckMod_Stats {
         /// <param name="playerSteamId">String, steam Id of the player.</param>
         /// <param name="takeaway">Int, number of takeaways.</param>
         private static void LogTakeaways(string playerSteamId, int takeaway) {
-            Logging.Log($"playerSteamId:{playerSteamId},takeaway:{takeaway}", ServerConfig);
+            Logging.Log($"playerSteamId:{playerSteamId},takeaway:{takeaway}", ModServerConfig);
         }
 
         /// <summary>
@@ -7708,7 +8476,7 @@ namespace oomtm450PuckMod_Stats {
         /// <param name="playerSteamId">String, steam Id of the player.</param>
         /// <param name="turnover">Int, number of turnovers.</param>
         private static void LogTurnovers(string playerSteamId, int turnover) {
-            Logging.Log($"playerSteamId:{playerSteamId},turnover:{turnover}", ServerConfig);
+            Logging.Log($"playerSteamId:{playerSteamId},turnover:{turnover}", ModServerConfig);
         }
 
         /// <summary>
@@ -7717,7 +8485,7 @@ namespace oomtm450PuckMod_Stats {
         /// <param name="playerSteamId">String, steam Id of the player.</param>
         /// <param name="pass">Int, number of passes.</param>
         private static void LogPass(string playerSteamId, int pass) {
-            Logging.Log($"playerSteamId:{playerSteamId},pass:{pass}", ServerConfig);
+            Logging.Log($"playerSteamId:{playerSteamId},pass:{pass}", ModServerConfig);
         }
 
         /// <summary>
@@ -7726,7 +8494,7 @@ namespace oomtm450PuckMod_Stats {
         /// <param name="playerSteamId">String, steam Id of the player.</param>
         /// <param name="puckTouch">Int, number of puck touches.</param>
         private static void LogPuckTouch(string playerSteamId, int puckTouch) {
-            Logging.Log($"playerSteamId:{playerSteamId},pucktouch:{puckTouch}", ServerConfig);
+            Logging.Log($"playerSteamId:{playerSteamId},pucktouch:{puckTouch}", ModServerConfig);
         }
 
         /// <summary>
@@ -7734,7 +8502,94 @@ namespace oomtm450PuckMod_Stats {
         /// </summary>
         /// <param name="playerSteamId">String, steam Id of the player.</param>
         private static void LogGWG(string playerSteamId) {
-            Logging.Log($"playerSteamId:{playerSteamId},gwg:1", ServerConfig);
+            Logging.Log($"playerSteamId:{playerSteamId},gwg:1", ModServerConfig);
+        }
+
+        /// <summary>
+        /// Computes star points from the already-built playersList (uses our own tracked data,
+        /// not live PlayerManager objects which may be unavailable at game end).
+        /// Updates _stars[1/2/3] so the in-game display is also correct, then returns _stars.
+        /// </summary>
+        private static LockDictionary<int, string> ComputeAndSetStars(List<Dictionary<string, object>> playersList, string gwgSteamId) {
+            try {
+                int blueScore = _goals.Count(g => g.Team == "Blue");
+                int redScore  = _goals.Count(g => g.Team == "Red");
+                string winningTeam = blueScore > redScore ? "Blue" : (redScore > blueScore ? "Red" : "");
+
+                const double GOAL_ALLOWED_PENALTY  = -10d;
+                const double SHOT_FACED_POINTS     =  10d;
+                const double SHUTOUT_BONUS         = 100d;
+                const double GOALIE_GOAL_MODIFIER  = 175d;
+                const double GOALIE_ASSIST_MODIFIER =  30d;
+                const double SKATER_GOAL_MODIFIER  =  70d;
+                const double SKATER_ASSIST_MODIFIER =  30d;
+
+                var starPoints = new Dictionary<string, double>();
+
+                foreach (var p in playersList) {
+                    string steamId  = p.TryGetValue("steamId",  out object sid)  ? (string)sid  : "";
+                    string team     = p.TryGetValue("team",     out object tm)   ? (string)tm   : "";
+                    string position = p.TryGetValue("position", out object pos)  ? (string)pos  : "";
+
+                    if (string.IsNullOrEmpty(steamId) || team == "spectator")
+                        continue;
+
+                    int goals    = p.TryGetValue("goals",     out object g)  ? (int)g  : 0;
+                    int assists  = p.TryGetValue("assists",   out object a)  ? (int)a  : 0;
+                    int sog      = p.TryGetValue("sog",       out object s)  ? (int)s  : 0;
+                    int passes   = p.TryGetValue("passes",    out object pa) ? (int)pa : 0;
+                    int blocks   = p.TryGetValue("blocks",    out object bl) ? (int)bl : 0;
+                    int hits     = p.TryGetValue("hits",      out object h)  ? (int)h  : 0;
+                    int takeaways= p.TryGetValue("takeaways", out object ta) ? (int)ta : 0;
+                    int turnovers= p.TryGetValue("turnovers", out object to) ? (int)to : 0;
+                    int exits    = p.TryGetValue("exits",     out object ex) ? (int)ex : 0;
+                    int entries  = p.TryGetValue("entries",   out object en) ? (int)en : 0;
+
+                    double pts = 0d;
+                    double gwgMod    = gwgSteamId == steamId ? 0.5d : 0d;
+                    double teamMod   = (winningTeam == team) ? 1.1d : 1d;
+
+                    bool isGoalie = position == "G";
+                    if (isGoalie) {
+                        int shotsFaced = p.TryGetValue("shotsFaced", out object sf) ? (int)sf : 0;
+                        int saves      = p.TryGetValue("saves",      out object sv) ? (int)sv : 0;
+                        int ga         = p.TryGetValue("goalsAllowed", out object gaVal) ? (int)gaVal : 0;
+                        pts += ga * GOAL_ALLOWED_PENALTY;
+                        pts += shotsFaced * SHOT_FACED_POINTS;
+                        if (ga == 0 && shotsFaced > 0) pts += SHUTOUT_BONUS;
+                        pts += passes * 2.5d;
+                        pts += GOALIE_GOAL_MODIFIER  * gwgMod;
+                        pts += goals   * GOALIE_GOAL_MODIFIER;
+                        pts += assists * GOALIE_ASSIST_MODIFIER;
+                    } else {
+                        pts += sog     * 7.5d;
+                        pts += passes  * 2.5d;
+                        pts += blocks  * 5d;
+                        pts += SKATER_GOAL_MODIFIER  * gwgMod;
+                        pts += goals   * SKATER_GOAL_MODIFIER;
+                        pts += assists * SKATER_ASSIST_MODIFIER;
+                    }
+
+                    pts += hits      * 2.5d;
+                    pts += takeaways * 5d;
+                    pts -= turnovers * 5d;
+                    pts += exits     * 1d;
+                    pts += entries   * 1d;
+                    pts *= teamMod;
+
+                    starPoints[steamId] = pts;
+                }
+
+                var ranked = starPoints.OrderByDescending(x => x.Value).ToList();
+                _stars[1] = ranked.Count >= 1 ? ranked[0].Key : "";
+                _stars[2] = ranked.Count >= 2 ? ranked[1].Key : "";
+                _stars[3] = ranked.Count >= 3 ? ranked[2].Key : "";
+            }
+            catch (Exception ex) {
+                Logging.LogError($"Error computing stars: {ex.Message}", ModServerConfig);
+                _stars[1] = _stars[2] = _stars[3] = "";
+            }
+            return _stars;
         }
 
         /// <summary>
@@ -7743,7 +8598,7 @@ namespace oomtm450PuckMod_Stats {
         /// <param name="playerSteamId">String, steam Id of the player.</param>
         /// <param name="starIndex">Int, star number of the player (1 is first star, etc.).</param>
         private static void LogStar(string playerSteamId, int starIndex) {
-            Logging.Log($"playerSteamId:{playerSteamId},star:{starIndex}", ServerConfig);
+            Logging.Log($"playerSteamId:{playerSteamId},star:{starIndex}", ModServerConfig);
         }
 
         #region Play-by-Play Methods
@@ -7753,7 +8608,7 @@ namespace oomtm450PuckMod_Stats {
         /// </summary>
         private static void RecordPlayByPlayEventInternal(PlayByPlayEventType eventType, Player player, Vector3 position, Vector3 velocity, string outcome = "successful", string flags = "", float? playerSpeedOverride = null, bool skipPossessionReset = false, float? gameTimeOverride = null, string teamInPossessionOverride = null) {
             // Use same game active check as existing stats mod - only track during Playing phase (FaceOff is just a 3 second delay)
-            if (!ServerFunc.IsDedicatedServer() || _paused || GameManager.Instance == null || GameManager.Instance.Phase != GamePhase.Playing || !_logic)
+            if (!ServerFunc.IsDedicatedServer() || _paused || GameManager.Instance == null || GameManager.Instance.Phase != GamePhase.Play || !_logic)
                 return;
 
             if (player == null || !player)
@@ -7768,14 +8623,14 @@ namespace oomtm450PuckMod_Stats {
             }
 
             try {
-                string playerSteamId = player.SteamId.Value.ToString();
+                string playerSteamId = player.SteamId.Value.Value;
                 if (string.IsNullOrEmpty(playerSteamId))
                     return;
 
-                EventZone zone = DetermineEventZone(position, player.Team.Value);
+                EventZone zone = DetermineEventZone(position, player.Team);
                 float gameTime = gameTimeOverride ?? GetCurrentGameTime();
                 int period = GetCurrentPeriod();
-                PlayerTeam eventTeam = player.Team.Value;
+                PlayerTeam eventTeam = player.Team;
 
                 // Track play sequence - increment if same team, reset if possession changes
                 // Puck battles do NOT reset possession chains - they maintain the current possession
@@ -7936,7 +8791,7 @@ namespace oomtm450PuckMod_Stats {
                     GameTime = gameTime,
                     Period = period,
                     PlayerSteamId = playerSteamId,
-                    PlayerName = player.Username.Value.ToString(),
+                    PlayerName = player.Username.Value.Value,
                     PlayerTeam = (int)eventTeam,
                     PlayerPosition = GetPlayerPosition(player),
                     PlayerJersey = player.Number.Value,
@@ -7979,7 +8834,15 @@ namespace oomtm450PuckMod_Stats {
                 }
                 
                 _lastEvent = pbpEvent; // Update last event for turnover/takeaway detection
-                
+#if DEBUG_MODE
+                // Log key event types (not every touch ? that would be thousands of lines)
+                if (eventType == PlayByPlayEventType.Goal || eventType == PlayByPlayEventType.OwnGoal ||
+                    eventType == PlayByPlayEventType.Shot || eventType == PlayByPlayEventType.Save ||
+                    eventType == PlayByPlayEventType.Block || eventType == PlayByPlayEventType.Faceoff ||
+                    eventType == PlayByPlayEventType.Takeaway || eventType == PlayByPlayEventType.Turnover) {
+                    DebugTrace.Write("PBP", $"Event #{_playByPlayEvents.Count} {eventType} player={player?.Username?.Value} outcome={outcome} period={GetCurrentPeriod()} gameTime={GetCurrentGameTime():F1}s");
+                }
+#endif
                 // If this is a shot event, check if we need to cancel any recent turnovers
                 // This handles cases where shot tracking has a delay and the shot event is created after the turnover validation
                 if (eventType == PlayByPlayEventType.Shot && gameTime > 0f) {
@@ -8021,7 +8884,7 @@ namespace oomtm450PuckMod_Stats {
                             
                             // Track team exit stat
                             if (player != null && player) {
-                                PlayerTeam playerTeam = player.Team.Value;
+                                PlayerTeam playerTeam = player.Team;
                                 if (!_teamExits.TryGetValue(playerTeam, out int _))
                                     _teamExits.Add(playerTeam, 0);
                                 _teamExits[playerTeam] += 1;
@@ -8036,7 +8899,7 @@ namespace oomtm450PuckMod_Stats {
                             
                             // Track team entry stat
                             if (player != null && player) {
-                                PlayerTeam playerTeam = player.Team.Value;
+                                PlayerTeam playerTeam = player.Team;
                                 if (!_teamEntries.TryGetValue(playerTeam, out int _))
                                     _teamEntries.Add(playerTeam, 0);
                                 _teamEntries[playerTeam] += 1;
@@ -8052,7 +8915,7 @@ namespace oomtm450PuckMod_Stats {
                 _lastEvent = pbpEvent; // Track last event for outcome determination
             }
             catch (Exception ex) {
-                Logging.LogError($"Error recording play-by-play event: {ex}", ServerConfig);
+                Logging.LogError($"Error recording play-by-play event: {ex}", ModServerConfig);
             }
         }
 
@@ -8119,7 +8982,7 @@ namespace oomtm450PuckMod_Stats {
                 _lastEvent = faceoffEvent; // Set last event to faceoff to prevent takeaways
             }
             catch (Exception ex) {
-                Logging.LogError($"Error recording faceoff event: {ex}", ServerConfig);
+                Logging.LogError($"Error recording faceoff event: {ex}", ModServerConfig);
             }
         }
 
@@ -8130,7 +8993,7 @@ namespace oomtm450PuckMod_Stats {
             // Find center for this team
             Player center = allPlayers.FirstOrDefault(p => 
                 p != null && p && 
-                p.Team.Value == team && 
+                p.Team == team && 
                 GetPlayerPosition(p) == "C");
 
             PlayByPlayEvent outcomeEvent;
@@ -8140,8 +9003,8 @@ namespace oomtm450PuckMod_Stats {
                     EventType = PlayByPlayEventType.FaceoffOutcome,
                     GameTime = gameTime,
                     Period = period,
-                    PlayerSteamId = center.SteamId.Value.ToString(),
-                    PlayerName = center.Username.Value.ToString(),
+                    PlayerSteamId = center.SteamId.Value.Value,
+                    PlayerName = center.Username.Value.Value,
                     PlayerTeam = (int)team,
                     PlayerPosition = "C",
                     PlayerJersey = center.Number.Value,
@@ -8224,7 +9087,7 @@ namespace oomtm450PuckMod_Stats {
                 UpdateFaceoffStatsFromPbp();
             }
             catch (Exception ex) {
-                Logging.LogError($"Error resolving pending faceoff on tracking stop: {ex}", ServerConfig);
+                Logging.LogError($"Error resolving pending faceoff on tracking stop: {ex}", ModServerConfig);
             }
         }
 
@@ -8234,7 +9097,7 @@ namespace oomtm450PuckMod_Stats {
         /// <param name="winningTeam">The team that won (if won=true) or lost (if won=false)</param>
         /// <param name="won">True if this team won (3+ chain), false if they lost possession</param>
         private static void RecordFaceoffOutcome(PlayerTeam winningTeam, bool won) {
-            if (!ServerFunc.IsDedicatedServer() || _paused || GameManager.Instance == null || GameManager.Instance.Phase != GamePhase.Playing || !_logic)
+            if (!ServerFunc.IsDedicatedServer() || _paused || GameManager.Instance == null || GameManager.Instance.Phase != GamePhase.Play || !_logic)
                 return;
 
             try {
@@ -8292,7 +9155,7 @@ namespace oomtm450PuckMod_Stats {
                 }
             }
             catch (Exception ex) {
-                Logging.LogError($"Error recording faceoff outcome: {ex}", ServerConfig);
+                Logging.LogError($"Error recording faceoff outcome: {ex}", ModServerConfig);
             }
         }
 
@@ -8303,7 +9166,7 @@ namespace oomtm450PuckMod_Stats {
             // Find center for this team
             Player center = allPlayers.FirstOrDefault(p => 
                 p != null && p && 
-                p.Team.Value == team && 
+                p.Team == team && 
                 GetPlayerPosition(p) == "C");
 
             if (center != null) {
@@ -8312,8 +9175,8 @@ namespace oomtm450PuckMod_Stats {
                     EventType = PlayByPlayEventType.FaceoffOutcome,
                     GameTime = gameTime,
                     Period = period,
-                    PlayerSteamId = center.SteamId.Value.ToString(),
-                    PlayerName = center.Username.Value.ToString(),
+                    PlayerSteamId = center.SteamId.Value.Value,
+                    PlayerName = center.Username.Value.Value,
                     PlayerTeam = (int)team,
                     PlayerPosition = "C",
                     PlayerJersey = center.Number.Value,
@@ -8414,9 +9277,8 @@ namespace oomtm450PuckMod_Stats {
                 return 0f;
 
             try {
-                // Use exact same method as Ruleset mod: GameManager.Instance.GameState.Value.Time
-                var gameState = GameManager.Instance.GameState.Value;
-                int timeRemaining = gameState.Time;
+                // Use GameManager convenience property: GameManager.Instance.Tick (countdown ticks)
+                int timeRemaining = GameManager.Instance.Tick;
                 
                 // Convert countdown to elapsed time for current period
                 float periodElapsedTime = 300f - timeRemaining;
@@ -8449,7 +9311,7 @@ namespace oomtm450PuckMod_Stats {
                 }
                 
                 // Always calculate fractional seconds when in Playing phase for consistent decimal precision
-                if (GameManager.Instance.Phase == GamePhase.Playing) {
+                if (GameManager.Instance.Phase == GamePhase.Play) {
                     // Initialize tracking if not already done
                     if (_lastUnityTimeForGameTime <= 0f || _lastCountdownValue == -1) {
                         _lastWholeSecondGameTime = wholeSecondGameTime;
@@ -8493,7 +9355,7 @@ namespace oomtm450PuckMod_Stats {
                 return wholeSecondGameTime;
             }
             catch (Exception ex) {
-                Logging.LogError($"Error in GetCurrentGameTime: {ex}", ServerConfig);
+                Logging.LogError($"Error in GetCurrentGameTime: {ex}", ModServerConfig);
                 return 0f;
             }
         }
@@ -8535,18 +9397,12 @@ namespace oomtm450PuckMod_Stats {
                 return 0;
 
             try {
-                // Use same pattern as Ruleset mod: direct property access on GameState.Value
-                var gameState = GameManager.Instance.GameState.Value;
-                
-                // Try direct property access (like BlueScore/RedScore/Time)
-                int period = gameState.Period;
-                
-                if (period > 0) {
+                int period = GameManager.Instance.Period;
+                if (period > 0)
                     return period;
-                }
             }
             catch (Exception ex) {
-                Logging.LogError($"Error in GetCurrentPeriod: {ex}", ServerConfig);
+                Logging.LogError($"Error in GetCurrentPeriod: {ex}", ModServerConfig);
             }
 
             return 0;
@@ -8561,20 +9417,12 @@ namespace oomtm450PuckMod_Stats {
 
             try {
                 if (PlayerFunc.IsGoalie(player))
-                    return "G";
+                    return PlayerFunc.GOALIE_POSITION;
 
-                var positionField = typeof(Player).GetField("PlayerPosition", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic);
-                if (positionField != null) {
-                    var positionValue = positionField.GetValue(player);
-                    if (positionValue != null) {
-                        string positionStr = positionValue.ToString();
-                        // Remove enum suffix if present
-                        if (positionStr.Contains("(")) {
-                            positionStr = positionStr.Substring(0, positionStr.IndexOf("(")).Trim();
-                        }
-                        return positionStr;
-                    }
-                }
+                // Player.PlayerPosition is a PlayerPosition NetworkBehaviour; Name holds "C", "LW", etc.
+                PlayerPosition positionComponent = player.PlayerPosition;
+                if (positionComponent != null && !string.IsNullOrEmpty(positionComponent.Name))
+                    return positionComponent.Name;
             }
             catch { }
 
@@ -8600,16 +9448,23 @@ namespace oomtm450PuckMod_Stats {
             }
         }
 
+        private static void ScheduleScoreboardReorder(VisualElement scoreboardContainer) {
+            if (scoreboardContainer == null)
+                return;
+
+            scoreboardContainer.schedule.Execute(() => ReorderScoreboardPlayers(scoreboardContainer)).ExecuteLater(0);
+        }
+
         /// <summary>
         /// Reorders players in the scoreboard by position: C, LW, RW, LD, RD, G, N/A
         /// Red team first, then Blue team
         /// </summary>
         private static void ReorderScoreboardPlayers(VisualElement scoreboardContainer) {
-            if (scoreboardContainer == null || UIScoreboard.Instance == null)
+            if (scoreboardContainer == null || MonoBehaviourSingleton<UIManager>.Instance.Scoreboard == null)
                 return;
 
             try {
-                var playerVisualElementMap = SystemFunc.GetPrivateField<Dictionary<Player, VisualElement>>(typeof(UIScoreboard), UIScoreboard.Instance, "playerVisualElementMap");
+                var playerVisualElementMap = SystemFunc.GetPrivateField<Dictionary<Player, VisualElement>>(typeof(UIScoreboard), MonoBehaviourSingleton<UIManager>.Instance.Scoreboard, "playerVisualElementMap");
                 if (playerVisualElementMap == null || playerVisualElementMap.Count == 0)
                     return;
 
@@ -8618,8 +9473,8 @@ namespace oomtm450PuckMod_Stats {
                     Player = kvp.Key,
                     VisualElement = kvp.Value,
                     Position = GetPlayerPosition(kvp.Key),
-                    Team = kvp.Key.Team.Value,
-                    OrderPriority = GetPositionOrderPriority(GetPlayerPosition(kvp.Key), kvp.Key.Team.Value)
+                    Team = kvp.Key.Team,
+                    OrderPriority = GetPositionOrderPriority(GetPlayerPosition(kvp.Key), kvp.Key.Team)
                 }).OrderBy(p => p.OrderPriority).ToList();
 
                 // Group by parent container (players might be in different containers)
@@ -8683,10 +9538,6 @@ namespace oomtm450PuckMod_Stats {
                 if (PlayerManager.Instance == null)
                     return;
 
-                var allPlayers = PlayerManager.Instance.GetPlayers();
-                if (allPlayers == null)
-                    return;
-
                 PlayerTeam playerTeam = (PlayerTeam)gameEvent.PlayerTeam;
                 PlayerTeam opposingTeam;
                 
@@ -8703,8 +9554,8 @@ namespace oomtm450PuckMod_Stats {
                     opposingTeam = playerTeam == PlayerTeam.Blue ? PlayerTeam.Red : PlayerTeam.Blue;
                 }
 
-                var teamPlayers = allPlayers.Where(p => p != null && p && p.Team.Value == playerTeam).ToList();
-                var opposingTeamPlayers = allPlayers.Where(p => p != null && p && p.Team.Value == opposingTeam).ToList();
+                var teamPlayers = PlayerManager.Instance.GetSpawnedPlayersByTeam(playerTeam, false);
+                var opposingTeamPlayers = PlayerManager.Instance.GetSpawnedPlayersByTeam(opposingTeam, false);
 
                 // Team forwards (C, LW, RW)
                 var teamForwards = teamPlayers.Where(p => {
@@ -8745,7 +9596,7 @@ namespace oomtm450PuckMod_Stats {
                 gameEvent.OpposingTeamGoalieSteamID = string.Join(";", opposingGoalies);
             }
             catch (Exception ex) {
-                Logging.LogError($"Error capturing team roster data: {ex}", ServerConfig);
+                Logging.LogError($"Error capturing team roster data: {ex}", ModServerConfig);
             }
         }
 
@@ -8756,7 +9607,7 @@ namespace oomtm450PuckMod_Stats {
         /// </summary>
         private static void ExportPlayByPlayCSVInternal() {
             if (_playByPlayEvents.Count == 0) {
-                Logging.Log("No play-by-play events to export", ServerConfig);
+                Logging.Log("No play-by-play events to export", ModServerConfig);
                 return;
             }
             
@@ -8770,7 +9621,7 @@ namespace oomtm450PuckMod_Stats {
                 }
             }
             if (convertedAttempts > 0) {
-                Logging.Log($"Converted {convertedAttempts} pending shot 'attempt' outcomes to 'missed' before CSV export", ServerConfig);
+                Logging.Log($"Converted {convertedAttempts} pending shot 'attempt' outcomes to 'missed' before CSV export", ModServerConfig);
             }
 
             try {
@@ -8781,7 +9632,7 @@ namespace oomtm450PuckMod_Stats {
                 // Use the game reference ID from game start, or generate one if not set
                 string gameReferenceId = !string.IsNullOrEmpty(_currentGameReferenceId) ? _currentGameReferenceId : DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
                 // Sanitize FileHeaderName to remove any HTML tags that might have been added
-                string sanitizedFileHeader = StripHtmlTags(ServerConfig.FileHeaderName);
+                string sanitizedFileHeader = StripHtmlTags(ModServerConfig.FileHeaderName);
                 string csvPath = Path.Combine(statsFolderPath, $"{sanitizedFileHeader}_{gameReferenceId}_playbyplay.csv");
 
                 var csv = new StringBuilder();
@@ -8823,10 +9674,10 @@ namespace oomtm450PuckMod_Stats {
                 }
 
                 File.WriteAllText(csvPath, csv.ToString(), Encoding.UTF8);
-                Logging.Log($"Play-by-play data exported to {csvPath} with {_playByPlayEvents.Count} events", ServerConfig);
+                Logging.Log($"Play-by-play data exported to {csvPath} with {_playByPlayEvents.Count} events", ModServerConfig);
             }
             catch (Exception ex) {
-                Logging.LogError($"Can't write the play-by-play data in the stats folder. (Permission error ?)\n{ex}", ServerConfig);
+                Logging.LogError($"Can't write the play-by-play data in the stats folder. (Permission error ?)\n{ex}", ModServerConfig);
             }
         }
 
@@ -8835,61 +9686,46 @@ namespace oomtm450PuckMod_Stats {
         /// </summary>
         /// <param name="forceExport">If true, bypasses the 8+ players and 300+ events requirement (for /endgame command)</param>
         private static void ExportGameStats(bool forceExport = false) {
+#if DEBUG_MODE
+            DebugTrace.Section("EXPORT");
+            DebugTrace.Write("EXPORT", $"ExportGameStats called. forceExport={forceExport} pbpEvents={_playByPlayEvents.Count} goals={_goals.Count}");
+#endif
             if (_playByPlayEvents.Count == 0) {
-                Logging.Log("No play-by-play events to export", ServerConfig);
+                Logging.Log("No play-by-play events to export", ModServerConfig);
+#if DEBUG_MODE
+                DebugTrace.Write("EXPORT", "ABORT ? _playByPlayEvents is empty, nothing to export.");
+                DebugTrace.Flush();
+#endif
                 return;
             }
             
-            // Calculate game-winning goal - find the goal that put the winning team ahead for good
+            // Calculate game-winning goal using _goals (authoritative — GameManager scores are
+            // zeroed by the time the export runs at game end).
             string gwgSteamId = "";
-            if (GameManager.Instance != null && GameManager.Instance.GameState != null) {
-                try {
-                    int blueScore = GameManager.Instance.GameState.Value.BlueScore;
-                    int redScore = GameManager.Instance.GameState.Value.RedScore;
-                    
-                    if (blueScore > redScore) {
-                        // Blue won - find the goal where Blue first took the lead
-                        int blueGoalsScored = 0;
-                        int redGoalsScored = 0;
-                        foreach (GoalInfo goal in _goals.OrderBy(g => g.GameTime)) {
-                            if (goal.Team == "Blue") {
-                                blueGoalsScored++;
-                            } else {
-                                redGoalsScored++;
-                            }
-                            
-                            // Check if this goal put Blue ahead
-                            if (goal.Team == "Blue" && blueGoalsScored > redGoalsScored && blueGoalsScored == redScore + 1) {
-                                gwgSteamId = goal.Scorer;
-                                goal.GWG = true;
-                                break;
-                            }
+            try {
+                int blueScore = _goals.Count(g => g.Team == "Blue");
+                int redScore  = _goals.Count(g => g.Team == "Red");
+
+                // Clear any previously-marked GWG flag so we start fresh.
+                foreach (GoalInfo g in _goals) g.GWG = false;
+
+                string winningTeamStr = blueScore > redScore ? "Blue" : (redScore > blueScore ? "Red" : "");
+                if (!string.IsNullOrEmpty(winningTeamStr)) {
+                    int winnerGoals = 0, loserGoals = 0;
+                    int loserFinalScore = winningTeamStr == "Blue" ? redScore : blueScore;
+                    foreach (GoalInfo goal in _goals.OrderBy(g => g.GameTime)) {
+                        if (goal.Team == winningTeamStr) winnerGoals++;
+                        else                             loserGoals++;
+                        // GWG = the goal that put the winner permanently ahead
+                        if (goal.Team == winningTeamStr && winnerGoals > loserGoals && winnerGoals == loserFinalScore + 1) {
+                            gwgSteamId = goal.Scorer;
+                            goal.GWG = true;
+                            break;
                         }
                     }
-                    else if (redScore > blueScore) {
-                        // Red won - find the goal where Red first took the lead
-                        int blueGoalsScored = 0;
-                        int redGoalsScored = 0;
-                        foreach (GoalInfo goal in _goals.OrderBy(g => g.GameTime)) {
-                            if (goal.Team == "Blue") {
-                                blueGoalsScored++;
-                            } else {
-                                redGoalsScored++;
-                            }
-                            
-                            // Check if this goal put Red ahead
-                            if (goal.Team == "Red" && redGoalsScored > blueGoalsScored && redGoalsScored == blueScore + 1) {
-                                gwgSteamId = goal.Scorer;
-                                goal.GWG = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-                catch {
-                    // If calculation fails for any reason, leave empty
                 }
             }
+            catch { }
             
             // Check play-by-play data before creating JSON - always validate criteria
             // Count unique SteamIDs from play-by-play events
@@ -8905,29 +9741,32 @@ namespace oomtm450PuckMod_Stats {
                 uniquePlayerCount = uniqueSteamIds;
             }
             catch (Exception ex) {
-                Logging.LogError($"Error counting unique players for export: {ex}", ServerConfig);
+                Logging.LogError($"Error counting unique players for export: {ex}", ModServerConfig);
             }
             
             // Validate criteria (8+ players and 300+ events) unless limit is disabled
-            bool meetsCriteria = !ServerConfig.EnableExportLimit || (uniquePlayerCount >= 8 && eventCount >= 300);
+            bool meetsCriteria = !ModServerConfig.EnableExportLimit || (uniquePlayerCount >= 8 && eventCount >= 300);
             
             // Log validation results
             if (forceExport) {
                 if (meetsCriteria) {
-                    if (!ServerConfig.EnableExportLimit) {
-                        Logging.Log($"Export requested via /endgame - Export limit disabled, exporting regardless of criteria", ServerConfig);
+                    if (!ModServerConfig.EnableExportLimit) {
+                        Logging.Log($"Export requested via /endgame - Export limit disabled, exporting regardless of criteria", ModServerConfig);
                     } else {
-                        Logging.Log($"Export requested via /endgame - Criteria met: {uniquePlayerCount} unique players (8+), {eventCount} events (300+)", ServerConfig);
+                        Logging.Log($"Export requested via /endgame - Criteria met: {uniquePlayerCount} unique players (8+), {eventCount} events (300+)", ModServerConfig);
                     }
                 } else {
-                    Logging.Log($"Export requested via /endgame - Criteria NOT met: {uniquePlayerCount} unique players (need 8+), {eventCount} events (need 300+). Export skipped.", ServerConfig);
+                    Logging.Log($"Export requested via /endgame - Criteria NOT met: {uniquePlayerCount} unique players (need 8+), {eventCount} events (need 300+). Export skipped.", ModServerConfig);
                 }
             } else {
-                if (!meetsCriteria && ServerConfig.EnableExportLimit) {
-                    Logging.Log($"Export skipped (JSON and CSV): {uniquePlayerCount} unique players (need 8+), {eventCount} events (need 300+)", ServerConfig);
+                if (!meetsCriteria && ModServerConfig.EnableExportLimit) {
+                    Logging.Log($"Export skipped (JSON and CSV): {uniquePlayerCount} unique players (need 8+), {eventCount} events (need 300+)", ModServerConfig);
                 }
             }
             
+#if DEBUG_MODE
+            DebugTrace.Write("EXPORT", $"Criteria check: uniquePlayers={uniquePlayerCount} events={eventCount} meetsCriteria={meetsCriteria} EnableExportLimit={ModServerConfig.EnableExportLimit} forceExport={forceExport}");
+#endif
             // Only create and export JSON and CSV if pbp check passes (8+ players and 300+ events)
             // forceExport flag is now only used for logging - criteria must still be met
             if (meetsCriteria) {
@@ -9025,7 +9864,7 @@ namespace oomtm450PuckMod_Stats {
                     
                     // Get player name from current player object or last play-by-play event
                     if (player != null && player) {
-                        playerName = player.Username.Value.ToString();
+                        playerName = player.Username.Value.Value;
                     } else {
                         var lastEvent = _playByPlayEvents
                             .LastOrDefault(e => e.PlayerSteamId == playerSteamId && !string.IsNullOrEmpty(e.PlayerName));
@@ -9103,6 +9942,7 @@ namespace oomtm450PuckMod_Stats {
                         { "exits", _exits.TryGetValue(playerSteamId, out int exits) ? exits : 0 },
                         { "entries", _entries.TryGetValue(playerSteamId, out int entries) ? entries : 0 },
                         { "hits", _hits.TryGetValue(playerSteamId, out int hits) ? hits : 0 },
+                        { "blocks", _blocks.TryGetValue(playerSteamId, out int blocks) ? blocks : 0 },
                         { "turnovers", _turnovers.TryGetValue(playerSteamId, out int turnovers) ? turnovers : 0 },
                         { "takeaways", _takeaways.TryGetValue(playerSteamId, out int takeaways) ? takeaways : 0 },
                         { "puckTouches", _puckTouches.TryGetValue(playerSteamId, out int puckTouches) ? puckTouches : 0 },
@@ -9125,9 +9965,14 @@ namespace oomtm450PuckMod_Stats {
                             saves = savePercValue.Saves;
                         }
                         
+                        // goalsAllowed = goals scored while this specific goalie was in net (excludes empty net / other stints)
+                        int goalsAllowedFromList = CountGoalsAllowedForGoalie(playerSteamId);
+                        shotsFaced = saves + goalsAllowedFromList;
+                        if (_savePerc.TryGetValue(playerSteamId, out var spAfterExport))
+                            _savePerc[playerSteamId] = (saves, shotsFaced);
                         playerStats["shotsFaced"] = shotsFaced;
                         playerStats["saves"] = saves;
-                        playerStats["goalsAllowed"] = shotsFaced - saves;
+                        playerStats["goalsAllowed"] = goalsAllowedFromList;
                         playerStats["saveperc"] = shotsFaced > 0 ? (double)saves / shotsFaced : 0.0;
                         playerStats["bodySaves"] = _bodySaves.TryGetValue(playerSteamId, out int bodySaves) ? bodySaves : 0;
                         playerStats["stickSaves"] = _stickSaves.TryGetValue(playerSteamId, out int stickSaves) ? stickSaves : 0;
@@ -9137,6 +9982,16 @@ namespace oomtm450PuckMod_Stats {
                 }
                 
                 // Calculate team stats
+                // Blocks are per-player only — aggregate from the player list
+                int blueTeamBlocks = 0, redTeamBlocks = 0;
+                foreach (var ps in playersList) {
+                    var p = (Dictionary<string, object>)ps;
+                    int b = p.TryGetValue("blocks", out object bVal) ? (int)bVal : 0;
+                    string t = p.TryGetValue("team", out object tVal) ? (string)tVal : "";
+                    if (t == "Blue") blueTeamBlocks += b;
+                    else if (t == "Red") redTeamBlocks += b;
+                }
+
                 int blueTeamSogs = _teamShots.TryGetValue(PlayerTeam.Blue, out int bs) ? bs : 0;
                 int redTeamSogs = _teamShots.TryGetValue(PlayerTeam.Red, out int rs) ? rs : 0;
                 int blueTeamPasses = _teamPasses.TryGetValue(PlayerTeam.Blue, out int bp) ? bp : 0;
@@ -9182,6 +10037,7 @@ namespace oomtm450PuckMod_Stats {
                         { "blueFaceoffsLost", blueFaceoffTotal > 0 ? blueFaceoffTotal - blueFaceoffWins : 0 },
                         { "blueTakeaways", blueTeamTakeaways },
                         { "blueTurnovers", blueTeamTurnovers },
+                        { "blueBlocks", blueTeamBlocks },
                         { "blueDZExits", blueTeamDZExits },
                         { "blueDZExitsAllowed", redTeamDZExits },
                         { "blueOZEntries", blueTeamOZEntries },
@@ -9196,6 +10052,7 @@ namespace oomtm450PuckMod_Stats {
                         { "redFaceoffsLost", redFaceoffTotal > 0 ? redFaceoffTotal - redFaceoffWins : 0 },
                         { "redTakeaways", redTeamTakeaways },
                         { "redTurnovers", redTeamTurnovers },
+                        { "redBlocks", redTeamBlocks },
                         { "redDZExits", redTeamDZExits },
                         { "redDZExitsAllowed", blueTeamDZExits },
                         { "redOZEntries", redTeamOZEntries },
@@ -9212,146 +10069,237 @@ namespace oomtm450PuckMod_Stats {
                             gwg = g.GWG
                         }).ToList() },
                         { "gwg", gwgSteamId },
-                        { "stars", _stars },
+                        { "stars", ComputeAndSetStars(playersList, gwgSteamId) },
                         { "gameTimeMinutes", totalGameTimeMinutes }
                     }}
                 };
                 
                 string jsonContent = JsonConvert.SerializeObject(jsonDict, Formatting.Indented);
-                Logging.Log("Stats:" + jsonContent, ServerConfig);
-                
+                Logging.Log("Stats:" + jsonContent, ModServerConfig);
+#if DEBUG_MODE
+                DebugTrace.Write("EXPORT", $"JSON serialized. contentLength={jsonContent.Length} chars. SaveEOGJSON={ModServerConfig.SaveEOGJSON}");
+#endif
                 // Export JSON file
-                if (ServerConfig.SaveEOGJSON) {
+                if (ModServerConfig.SaveEOGJSON) {
                     try {
                         string statsFolderPath = Path.Combine(Path.GetFullPath("."), "stats");
                         if (!Directory.Exists(statsFolderPath))
                             Directory.CreateDirectory(statsFolderPath);
                         
-                        // Use the game reference ID from game start, or generate one if not set (same as CSV)
                         string gameReferenceId = !string.IsNullOrEmpty(_currentGameReferenceId) ? _currentGameReferenceId : DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
-                        // Sanitize FileHeaderName to remove any HTML tags that might have been added
-                        string sanitizedFileHeader = StripHtmlTags(ServerConfig.FileHeaderName);
+                        string sanitizedFileHeader = StripHtmlTags(ModServerConfig.FileHeaderName);
                         string jsonPath = Path.Combine(statsFolderPath, sanitizedFileHeader + "_" + gameReferenceId + "_stats.json");
                         
                         File.WriteAllText(jsonPath, jsonContent);
-                        Logging.Log($"JSON exported: {uniquePlayerCount} unique players, {eventCount} events", ServerConfig);
+                        Logging.Log($"JSON exported: {uniquePlayerCount} unique players, {eventCount} events", ModServerConfig);
+#if DEBUG_MODE
+                        DebugTrace.Write("EXPORT", $"JSON written OK ? {jsonPath}  ({jsonContent.Length} bytes)");
+#endif
                     }
                     catch (Exception ex) {
-                        Logging.LogError($"Can't write the end of game stats in the stats folder. (Permission error ?)\n{ex}", ServerConfig);
+                        Logging.LogError($"Can't write the end of game stats in the stats folder. (Permission error ?)\n{ex}", ModServerConfig);
+#if DEBUG_MODE
+                        DebugTrace.Write("EXPORT", $"JSON write FAILED: {ex.Message}");
+#endif
                     }
                 }
-                
+#if DEBUG_MODE
+                else {
+                    DebugTrace.Write("EXPORT", "JSON export skipped ? SaveEOGJSON=false in server config.");
+                }
+#endif
                 // Export CSV
                 ExportPlayByPlayCSVInternal();
-                Logging.Log($"CSV exported: {uniquePlayerCount} unique players, {eventCount} events", ServerConfig);
+                Logging.Log($"CSV exported: {uniquePlayerCount} unique players, {eventCount} events", ModServerConfig);
+#if DEBUG_MODE
+                DebugTrace.Write("EXPORT", $"CSV export complete. Total pbpEvents={_playByPlayEvents.Count}");
+                DebugTrace.Flush();
+#endif
             }
         }
 
         /// <summary>
-        /// Chat command handler for early game end export
-        /// Handles /endgame command to export both JSON and CSV files early (for forfeits)
+        /// Chat command handler for server chat commands.
+        /// Postfix handles /statsversion and /endgame on Client_SendChatMessageRpc.
+        /// Chat output Prefixes suppress any stray "Unknown command" broadcast (async fallback).
         /// </summary>
-        [HarmonyPatch]
-        public static class UIChatController_Event_Server_OnChatCommand_Patch {
-            public static System.Reflection.MethodBase TargetMethod() {
-                // Search in all loaded assemblies for UIChatController
-                foreach (var assembly in System.AppDomain.CurrentDomain.GetAssemblies()) {
-                    try {
-                        var chatControllerType = assembly.GetTypes()
-                            .FirstOrDefault(t => t.Name == "UIChatController");
-                        if (chatControllerType != null) {
-                            var method = chatControllerType.GetMethods(System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic)
-                                .FirstOrDefault(m => m.Name == "Event_Server_OnChatCommand");
-                            if (method != null)
-                                return method;
-                        }
-                    }
-                    catch {
-                        // Skip assemblies that can't be inspected
-                        continue;
-                    }
-                }
-                return null;
+        [HarmonyPatch(typeof(ChatManager), "Client_SendChatMessageRpc")]
+        public static class ChatManager_Client_SendChatMessageRpc_Patch {
+            [HarmonyPrefix]
+            public static void Prefix(string content, bool isQuickChat, bool isTeamChat, Unity.Netcode.RpcParams rpcParams) {
+                if (!ServerFunc.IsDedicatedServer() || !_logic)
+                    return;
+
+                if (IsStatsModChatCommand(content))
+                    MarkSuppressUnknownChatCommand();
             }
 
-            public static void Postfix(object __instance, object[] __args) {
+            [HarmonyPostfix]
+            public static void Postfix(string content, bool isQuickChat, bool isTeamChat, Unity.Netcode.RpcParams rpcParams) {
                 try {
                     if (!ServerFunc.IsDedicatedServer() || !_logic)
                         return;
 
-                    // Extract chat message from arguments
-                    string msg = null;
-                    if (__args != null && __args.Length > 0) {
-                        var firstArg = __args[0];
-                        if (firstArg is System.Collections.IDictionary dict) {
-                            string[] possibleKeys = { "message", "text", "content", "msg", "command" };
-                            foreach (var key in possibleKeys) {
-                                if (dict.Contains(key) && dict[key] is string strValue) {
-                                    msg = strValue;
-                                    break;
-                                }
-                            }
-                        }
-                        else if (firstArg is string strArg) {
-                            msg = strArg;
-                        }
-                    }
-
-                    if (string.IsNullOrEmpty(msg))
-                        return;
-
-                    // Handle /endgame command to export both JSON and CSV early (for forfeits)
-                    if (msg.StartsWith("/endgame", StringComparison.OrdinalIgnoreCase)) {
-                        // Check if game is in warmup phase
-                        if (GameManager.Instance != null && GameManager.Instance.Phase == GamePhase.Warmup) {
-                            Logging.Log("Early game end export command received during warmup - no game to export", ServerConfig);
-                            if (UIChat.Instance != null) {
-                                UIChat.Instance.Server_SendSystemChatMessage("Cannot export stats during warmup - no game has started yet.");
-                            }
-                            return;
-                        }
-                        
-                        Logging.Log("Early game end export command received", ServerConfig);
-                        // Check criteria before exporting
-                        int uniquePlayerCount = 0;
-                        int eventCount = _playByPlayEvents.Count;
-                        
-                        try {
-                            var uniqueSteamIds = _playByPlayEvents
-                                .Where(e => !string.IsNullOrEmpty(e.PlayerSteamId))
-                                .Select(e => e.PlayerSteamId)
-                                .Distinct()
-                                .Count();
-                            uniquePlayerCount = uniqueSteamIds;
-                        }
-                        catch (Exception ex) {
-                            Logging.LogError($"Error counting unique players for /endgame export: {ex}", ServerConfig);
-                        }
-                        
-                        bool meetsCriteria = !ServerConfig.EnableExportLimit || (uniquePlayerCount >= 8 && eventCount >= 300);
-                        
-                        if (meetsCriteria) {
-                            if (!ServerConfig.EnableExportLimit) {
-                                Logging.Log($"Export requested via /endgame - Export limit disabled, exporting regardless of criteria", ServerConfig);
-                            }
-                            ExportGameStats(forceExport: true);
-                            if (UIChat.Instance != null) {
-                                string gameReferenceId = !string.IsNullOrEmpty(_currentGameReferenceId) ? _currentGameReferenceId : DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
-                                string sanitizedFileHeader = StripHtmlTags(ServerConfig.FileHeaderName);
-                                string fullFileName = $"{sanitizedFileHeader}_{gameReferenceId}_stats";
-                                int redScore = GameManager.Instance != null && GameManager.Instance.GameState != null ? GameManager.Instance.GameState.Value.RedScore : 0;
-                                int blueScore = GameManager.Instance != null && GameManager.Instance.GameState != null ? GameManager.Instance.GameState.Value.BlueScore : 0;
-                                UIChat.Instance.Server_SendSystemChatMessage($"Game stats exported early - Final Score: Red {redScore} - Blue {blueScore} | File: {fullFileName}");
-                            }
-                        } else {
-                            if (ServerConfig.EnableExportLimit && UIChat.Instance != null) {
-                                UIChat.Instance.Server_SendSystemChatMessage($"Cannot export stats - Game does not meet criteria: {uniquePlayerCount} unique players (need 8+), {eventCount} events (need 300+)");
-                            }
-                        }
-                    }
+                    TryHandleStatsModChatCommand(content, rpcParams);
                 }
                 catch (Exception ex) {
-                    Logging.LogError($"Error in chat command handler: {ex}", ServerConfig);
+                    Logging.LogError($"Error in chat command handler: {ex}", ModServerConfig);
+                }
+            }
+        }
+
+        [HarmonyPatch(typeof(ChatManager), nameof(ChatManager.Server_BroadcastChatMessage), typeof(string), typeof(string))]
+        public static class ChatManager_SuppressUnknownCommandBroadcast_Patch {
+            [HarmonyPrefix]
+            public static bool Prefix(string content, string color) {
+                return !ShouldSuppressUnknownChatOutput(content);
+            }
+        }
+
+        [HarmonyPatch(typeof(ChatManager), nameof(ChatManager.Server_BroadcastChatMessage), typeof(ChatMessage))]
+        public static class ChatManager_SuppressUnknownCommandBroadcastChatMessage_Patch {
+            [HarmonyPrefix]
+            public static bool Prefix(ChatMessage chatMessage) {
+                return !ShouldSuppressUnknownChatOutput(GetChatMessageText(chatMessage));
+            }
+        }
+
+        [HarmonyPatch(typeof(ChatManager), nameof(ChatManager.Server_SendChatMessage), typeof(string), typeof(string), typeof(ulong[]))]
+        public static class ChatManager_SuppressUnknownCommandSend_Patch {
+            [HarmonyPrefix]
+            public static bool Prefix(string content, string color, ulong[] clientIds) {
+                return !ShouldSuppressUnknownChatOutput(content);
+            }
+        }
+
+        [HarmonyPatch(typeof(ChatManager), nameof(ChatManager.Server_SendChatMessage), typeof(ChatMessage), typeof(ulong[]))]
+        public static class ChatManager_SuppressUnknownCommandSendChatMessage_Patch {
+            [HarmonyPrefix]
+            public static bool Prefix(ChatMessage chatMessage, ulong[] clientIds) {
+                return !ShouldSuppressUnknownChatOutput(GetChatMessageText(chatMessage));
+            }
+        }
+
+        private static void MarkSuppressUnknownChatCommand() {
+            _suppressUnknownChatCommandUntil = Time.time + 2f;
+        }
+
+        private static bool ShouldSuppressUnknownChatOutput(string content) {
+            if (Time.time > _suppressUnknownChatCommandUntil || !IsUnknownCommandBroadcast(content))
+                return false;
+
+            _suppressUnknownChatCommandUntil = 0f;
+            return true;
+        }
+
+        private static string GetChatMessageText(object chatMessage) {
+            if (chatMessage == null)
+                return "";
+
+            if (chatMessage is ChatMessage typed)
+                return typed.Content.ToString();
+
+            try {
+                FieldInfo contentField = chatMessage.GetType().GetField("Content");
+                return contentField?.GetValue(chatMessage)?.ToString() ?? "";
+            }
+            catch {
+                return "";
+            }
+        }
+
+        private static bool IsStatsModChatCommand(string msg) {
+            if (string.IsNullOrEmpty(msg))
+                return false;
+
+            msg = msg.Trim();
+            return msg.Equals("/statsversion", StringComparison.OrdinalIgnoreCase)
+                || msg.StartsWith("/endgame", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsUnknownCommandBroadcast(string content) {
+            return !string.IsNullOrEmpty(content)
+                && content.Trim().Equals("Unknown command", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static void TryHandleStatsModChatCommand(string content, Unity.Netcode.RpcParams rpcParams) {
+            if (string.IsNullOrEmpty(content))
+                return;
+
+            string msg = content;
+
+            if (msg.Trim().Equals("/statsversion", StringComparison.OrdinalIgnoreCase)) {
+                if (NetworkBehaviourSingleton<ChatManager>.Instance != null) {
+                    ulong senderClientId = rpcParams.Receive.SenderClientId;
+                    Player senderPlayer = PlayerManager.Instance.GetPlayerByClientId(senderClientId);
+                    string senderName = (senderPlayer != null && !string.IsNullOrEmpty(senderPlayer.Username.Value.Value))
+                        ? senderPlayer.Username.Value.Value
+                        : $"Client {senderClientId}";
+
+                    string senderVersionDisplay = "unknown";
+                    bool versionOk = false;
+                    if (_clientReportedModVersions.TryGetValue(senderClientId, out string reportedVersion)) {
+                        senderVersionDisplay = FormatReportedClientModVersion(reportedVersion);
+                        versionOk = IsClientModVersionCompatible(reportedVersion, MOD_VERSION);
+                    }
+
+                    string status = versionOk ? "✅" : "❌";
+                    NetworkBehaviourSingleton<ChatManager>.Instance.Server_BroadcastChatMessage(
+                        $"Stats mod server version: {MOD_VERSION}. {senderName} is using {senderVersionDisplay} {status}");
+                }
+                return;
+            }
+
+            if (msg.StartsWith("/endgame", StringComparison.OrdinalIgnoreCase)) {
+                ulong senderClientId = rpcParams.Receive.SenderClientId;
+                Player senderPlayer = PlayerManager.Instance.GetPlayerByClientId(senderClientId);
+                string senderSteamId = senderPlayer?.SteamId.Value.Value ?? "";
+                bool isAdmin = !string.IsNullOrEmpty(senderSteamId) &&
+                               MonoBehaviourSingleton<AdminManager>.Instance != null &&
+                               MonoBehaviourSingleton<AdminManager>.Instance.IsSteamIdAdmin(senderSteamId);
+                if (!isAdmin) {
+                    Logging.Log($"/endgame denied for client {senderClientId} (steamId={senderSteamId}) ? not an admin", ModServerConfig);
+                    return;
+                }
+
+                if (GameManager.Instance != null && GameManager.Instance.Phase == GamePhase.Warmup) {
+                    Logging.Log("Early game end export command received during warmup - no game to export", ModServerConfig);
+                    if (NetworkBehaviourSingleton<ChatManager>.Instance != null) {
+                        NetworkBehaviourSingleton<ChatManager>.Instance.Server_BroadcastChatMessage("Cannot export stats during warmup - no game has started yet.");
+                    }
+                    return;
+                }
+
+                Logging.Log("Early game end export command received", ModServerConfig);
+                int uniquePlayerCount = 0;
+                int eventCount = _playByPlayEvents.Count;
+
+                try {
+                    uniquePlayerCount = _playByPlayEvents
+                        .Where(e => !string.IsNullOrEmpty(e.PlayerSteamId))
+                        .Select(e => e.PlayerSteamId)
+                        .Distinct()
+                        .Count();
+                }
+                catch (Exception ex) {
+                    Logging.LogError($"Error counting unique players for /endgame export: {ex}", ModServerConfig);
+                }
+
+                bool meetsCriteria = !ModServerConfig.EnableExportLimit || (uniquePlayerCount >= 8 && eventCount >= 300);
+
+                if (meetsCriteria) {
+                    if (!ModServerConfig.EnableExportLimit) {
+                        Logging.Log($"Export requested via /endgame - Export limit disabled, exporting regardless of criteria", ModServerConfig);
+                    }
+                    ExportGameStats(forceExport: true);
+                    if (NetworkBehaviourSingleton<ChatManager>.Instance != null) {
+                        string gameReferenceId = !string.IsNullOrEmpty(_currentGameReferenceId) ? _currentGameReferenceId : DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+                        string sanitizedFileHeader = StripHtmlTags(ModServerConfig.FileHeaderName);
+                        string fullFileName = $"{sanitizedFileHeader}_{gameReferenceId}_stats";
+                        NetworkBehaviourSingleton<ChatManager>.Instance.Server_BroadcastChatMessage($"Game stats exported early - {fullFileName}");
+                    }
+                } else if (ModServerConfig.EnableExportLimit && NetworkBehaviourSingleton<ChatManager>.Instance != null) {
+                    NetworkBehaviourSingleton<ChatManager>.Instance.Server_BroadcastChatMessage($"Cannot export stats - Game does not meet criteria: {uniquePlayerCount} unique players (need 8+), {eventCount} events (need 300+)");
                 }
             }
         }
@@ -9640,7 +10588,7 @@ namespace oomtm450PuckMod_Stats {
                                 // Track team exit stat
                                 Player exitPlayer = PlayerManager.Instance.GetPlayerBySteamId(targetEvent.PlayerSteamId);
                                 if (exitPlayer != null && exitPlayer) {
-                                    PlayerTeam playerTeam = exitPlayer.Team.Value;
+                                    PlayerTeam playerTeam = exitPlayer.Team;
                                     if (!_teamExits.TryGetValue(playerTeam, out int _))
                                         _teamExits.Add(playerTeam, 0);
                                     _teamExits[playerTeam] += 1;
@@ -9656,7 +10604,7 @@ namespace oomtm450PuckMod_Stats {
                                 // Track team entry stat
                                 Player entryPlayer = PlayerManager.Instance.GetPlayerBySteamId(targetEvent.PlayerSteamId);
                                 if (entryPlayer != null && entryPlayer) {
-                                    PlayerTeam playerTeam = entryPlayer.Team.Value;
+                                    PlayerTeam playerTeam = entryPlayer.Team;
                                     if (!_teamEntries.TryGetValue(playerTeam, out int _))
                                         _teamEntries.Add(playerTeam, 0);
                                     _teamEntries[playerTeam] += 1;
@@ -9673,7 +10621,7 @@ namespace oomtm450PuckMod_Stats {
                 }
             }
             catch (Exception ex) {
-                Logging.LogError($"Error in AddZoneFlagsToPlayByPlayEvents: {ex}", ServerConfig);
+                Logging.LogError($"Error in AddZoneFlagsToPlayByPlayEvents: {ex}", ModServerConfig);
             }
         }
 
@@ -9743,18 +10691,22 @@ namespace oomtm450PuckMod_Stats {
         /// Safely sends data to all clients with validation and error handling.
         /// Returns true if successful, false if failed.
         /// </summary>
-        private static bool SafeSendDataToAll(string dataName, string dataValue) {
+        private static bool SafeSendDataToAll(string dataName, string dataValue, NetworkDelivery networkDelivery = NetworkDelivery.ReliableFragmentedSequenced) {
             if (!ValidateStringForNetwork(dataValue, dataName, out string validationError)) {
-                Logging.LogError($"Validation failed for {dataName}: {validationError}", ServerConfig);
+                Logging.LogError($"Validation failed for {dataName}: {validationError}", ModServerConfig);
                 return false;
             }
-            
+            // Avoid calling into network layer when manager is null (e.g. shutdown) to prevent MemCpy segfault
+            if (NetworkManager.Singleton == null || NetworkManager.Singleton.CustomMessagingManager == null) {
+                Logging.LogError("SafeSendDataToAll: NetworkManager not ready, skipping send", ModServerConfig);
+                return false;
+            }
             try {
-                NetworkCommunication.SendDataToAll(dataName, dataValue, Constants.FROM_SERVER_TO_CLIENT, ServerConfig);
+                NetworkCommunication.SendDataToAll(dataName, dataValue, Constants.FROM_SERVER_TO_CLIENT, ModServerConfig, networkDelivery);
                 return true;
             }
             catch (Exception ex) {
-                Logging.LogError($"Error sending data {dataName}: {ex}", ServerConfig);
+                Logging.LogError($"Error sending data {dataName}: {ex}", ModServerConfig);
                 return false;
             }
         }
@@ -9767,7 +10719,7 @@ namespace oomtm450PuckMod_Stats {
                 if ((now - _lastBatchingFailureTime).TotalSeconds >= BATCHING_DISABLE_DURATION_SECONDS) {
                     _batchingDisabled = false;
                     _batchingFailureCount = 0;
-                    Logging.Log("Batching re-enabled after cooldown period", ServerConfig);
+                    Logging.Log("Batching re-enabled after cooldown period", ModServerConfig);
                 }
                 else {
                     // Silently skip batching - game continues without stat updates
@@ -9775,7 +10727,12 @@ namespace oomtm450PuckMod_Stats {
                 }
             }
             
-            if (_pendingStatUpdates.Count == 0)
+            if (_pendingStatUpdates.Count == 0) {
+                _lastStatBatchSendTime = now;
+                return;
+            }
+            // Don't touch network when manager isn't ready (avoids MemCpy segfault in SendDataToAll)
+            if (NetworkManager.Singleton == null || NetworkManager.Singleton.CustomMessagingManager == null)
                 return;
             
             // Wrap entire method in try-catch to prevent server crashes
@@ -9785,6 +10742,13 @@ namespace oomtm450PuckMod_Stats {
             Dictionary<string, string> updatesSnapshot = new Dictionary<string, string>();
             foreach (var kvp in _pendingStatUpdates) {
                 updatesSnapshot[kvp.Key] = kvp.Value;
+            }
+            
+            // Check if reset happened while taking snapshot (reset clears _pendingStatUpdates)
+            // If so, discard the stale snapshot to prevent sending old data after RESET_ALL
+            if (_pendingStatUpdates.Count == 0 && updatesSnapshot.Count > 0) {
+                // Reset cleared pending updates - don't send stale batches
+                return;
             }
             
             // Group updates by stat type for batching
@@ -9963,7 +10927,7 @@ namespace oomtm450PuckMod_Stats {
                     
                     // Safety check: ensure we don't go negative (shouldn't happen, but defensive)
                     if (MAX_BATCH_BYTES < 1024) {
-                        Logging.LogError($"Batch data name too large ({batchDataNameByteSize} bytes) for {batchDataName}, using minimum batch size", ServerConfig);
+                        Logging.LogError($"Batch data name too large ({batchDataNameByteSize} bytes) for {batchDataName}, using minimum batch size", ModServerConfig);
                         MAX_BATCH_BYTES = 1024; // Use minimum safe size
                     }
                     
@@ -10023,12 +10987,12 @@ namespace oomtm450PuckMod_Stats {
                             int totalSize = batchDataNameByteSize + OVERHEAD_BYTES + batchDataByteSize;
                             
                             if (totalSize > MAX_SAFE_TOTAL_BYTES) {
-                                Logging.LogError($"Batch data still too large ({totalSize} total bytes = {batchDataNameByteSize} name + {OVERHEAD_BYTES} overhead + {batchDataByteSize} data) for {batchDataName} after splitting, skipping", ServerConfig);
+                                Logging.LogError($"Batch data still too large ({totalSize} total bytes = {batchDataNameByteSize} name + {OVERHEAD_BYTES} overhead + {batchDataByteSize} data) for {batchDataName} after splitting, skipping", ModServerConfig);
                                 continue;
                             }
                             
                             if (batchDataByteSize > MAX_BATCH_BYTES) {
-                                Logging.LogError($"Batch data still too large ({batchDataByteSize} bytes) for {batchDataName} after splitting, skipping", ServerConfig);
+                                Logging.LogError($"Batch data still too large ({batchDataByteSize} bytes) for {batchDataName} after splitting, skipping", ModServerConfig);
                                 continue;
                             }
                             
@@ -10039,7 +11003,7 @@ namespace oomtm450PuckMod_Stats {
                                 _lastBatchingFailureTime = now;
                                 if (_batchingFailureCount >= MAX_BATCHING_FAILURES) {
                                     _batchingDisabled = true;
-                                    Logging.LogError($"Batching disabled after {_batchingFailureCount} failures. Will re-enable after {BATCHING_DISABLE_DURATION_SECONDS} seconds.", ServerConfig);
+                                    Logging.LogError($"Batching disabled after {_batchingFailureCount} failures. Will re-enable after {BATCHING_DISABLE_DURATION_SECONDS} seconds.", ModServerConfig);
                                     // Clear pending updates to prevent accumulation
                                     _pendingStatUpdates.Clear();
                                     return;
@@ -10053,7 +11017,7 @@ namespace oomtm450PuckMod_Stats {
                     }
                     
                     if (batchChunks.Count > 1) {
-                        Logging.Log($"Split {batchDataName} batch into {batchChunks.Count} chunks due to size limit", ServerConfig);
+                        Logging.Log($"Split {batchDataName} batch into {batchChunks.Count} chunks due to size limit", ModServerConfig);
                     }
                 }
             }
@@ -10068,11 +11032,11 @@ namespace oomtm450PuckMod_Stats {
                 _batchingFailureCount++;
                 _lastBatchingFailureTime = now;
                 
-                Logging.LogError($"Critical error in SendBatchedStatUpdates: {ex}. Batching will be disabled if this happens {MAX_BATCHING_FAILURES} times.", ServerConfig);
+                Logging.LogError($"Critical error in SendBatchedStatUpdates: {ex}. Batching will be disabled if this happens {MAX_BATCHING_FAILURES} times.", ModServerConfig);
                 
                 if (_batchingFailureCount >= MAX_BATCHING_FAILURES) {
                     _batchingDisabled = true;
-                    Logging.LogError($"Batching permanently disabled after {_batchingFailureCount} critical failures. Will re-enable after {BATCHING_DISABLE_DURATION_SECONDS} seconds.", ServerConfig);
+                    Logging.LogError($"Batching permanently disabled after {_batchingFailureCount} critical failures. Will re-enable after {BATCHING_DISABLE_DURATION_SECONDS} seconds.", ModServerConfig);
                     // Clear pending updates to prevent accumulation
                     _pendingStatUpdates.Clear();
                 }
@@ -10081,27 +11045,76 @@ namespace oomtm450PuckMod_Stats {
             }
         }
 
+        private static string FormatReportedClientModVersion(string reportedVersion) {
+            if (string.IsNullOrEmpty(reportedVersion) || reportedVersion == "1")
+                return "unknown";
+            return reportedVersion;
+        }
+
+        /// <summary>
+        /// True when the client mod is the same version or newer than the server (e.g. client 1.3 on server 1.1).
+        /// </summary>
+        private static bool IsClientModVersionCompatible(string clientVersion, string serverVersion) {
+            if (string.IsNullOrEmpty(clientVersion) || clientVersion == "1")
+                return false;
+            if (clientVersion == serverVersion)
+                return true;
+            if (Version.TryParse(clientVersion, out Version client) && Version.TryParse(serverVersion, out Version server))
+                return client >= server;
+            return false;
+        }
+
+        /// <summary>
+        /// True only when the client mod is older than the server requires — not when the client is ahead.
+        /// </summary>
+        private static bool IsClientModVersionOutdated(string clientVersion, string serverRequiredVersion) {
+            if (string.IsNullOrEmpty(clientVersion) || clientVersion == "1")
+                return true;
+            if (clientVersion == serverRequiredVersion)
+                return false;
+            if (Version.TryParse(clientVersion, out Version client) && Version.TryParse(serverRequiredVersion, out Version required))
+                return client < required;
+            return clientVersion != serverRequiredVersion;
+        }
+
         private static string GetGoalieSavePerc(int saves, int shots) {
             if (shots == 0)
-                return "0.000";
+                return "0%";
 
-            return (((double)saves) / ((double)shots)).ToString("0.000", CultureInfo.InvariantCulture);
+            double pct = ((double)saves / (double)shots) * 100.0;
+            return pct.ToString("0.0", CultureInfo.InvariantCulture) + "%";
         }
 
         private static bool RulesetModEnabled() {
             return _rulesetModEnabled != null && (bool)_rulesetModEnabled;
         }
 
-        private static string GetStarTag(string playerSteamId) {
-            string star = "";
+        private static string GetStarTagForChat(string playerSteamId) {
             if (_stars[1] == playerSteamId)
-                star = "<color=#FFD700FF><b>★</b></color> ";
-            else if (_stars[2] == playerSteamId)
-                star = "<color=#C0C0C0FF><b>★</b></color> ";
-            else if (_stars[3] == playerSteamId)
-                star = "<color=#CD7F32FF><b>★</b></color> ";
+                return $"{MEDAL_GOLD} ";
+            if (_stars[2] == playerSteamId)
+                return $"{MEDAL_SILVER} ";
+            if (_stars[3] == playerSteamId)
+                return $"{MEDAL_BRONZE} ";
+            return "";
+        }
 
-            return star;
+        private static string GetStarTagForScoreboard(string playerSteamId) {
+            if (_stars[1] == playerSteamId)
+                return $"<color=#FFD700FF><b>{STAR_GLYPH}</b></color> ";
+            if (_stars[2] == playerSteamId)
+                return $"<color=#C0C0C0FF><b>{STAR_GLYPH}</b></color> ";
+            if (_stars[3] == playerSteamId)
+                return $"<color=#CD7F32FF><b>{STAR_GLYPH}</b></color> ";
+            return "";
+        }
+
+        private static void ApplyScoreboardStarTag(Label label, string playerSteamId) {
+            if (label == null || string.IsNullOrEmpty(playerSteamId) || !_stars.Values.Contains(playerSteamId))
+                return;
+            label.enableRichText = true;
+            string baseText = StripStarTags(label.text);
+            label.text = GetStarTagForScoreboard(playerSteamId) + baseText;
         }
 
         /// <summary>
@@ -10130,10 +11143,17 @@ namespace oomtm450PuckMod_Stats {
             if (string.IsNullOrEmpty(text))
                 return text;
 
-            // Remove all possible star tag patterns
-            text = text.Replace("<color=#FFD700FF><b>★</b></color> ", "");
-            text = text.Replace("<color=#C0C0C0FF><b>★</b></color> ", "");
-            text = text.Replace("<color=#CD7F32FF><b>★</b></color> ", "");
+            text = text.Replace($"{MEDAL_GOLD} ", "");
+            text = text.Replace($"{MEDAL_SILVER} ", "");
+            text = text.Replace($"{MEDAL_BRONZE} ", "");
+
+            text = text.Replace($"<color=#FFD700FF><b>{STAR_GLYPH}</b></color> ", "");
+            text = text.Replace($"<color=#C0C0C0FF><b>{STAR_GLYPH}</b></color> ", "");
+            text = text.Replace($"<color=#CD7F32FF><b>{STAR_GLYPH}</b></color> ", "");
+            text = text.Replace("? ", "");
+            text = text.Replace("<color=#FFD700FF><b>?</b></color> ", "");
+            text = text.Replace("<color=#C0C0C0FF><b>?</b></color> ", "");
+            text = text.Replace("<color=#CD7F32FF><b>?</b></color> ", "");
 
             return text;
         }
@@ -10148,7 +11168,7 @@ namespace oomtm450PuckMod_Stats {
 
                     Player currentPlayer = PlayerManager.Instance.GetPlayerBySteamId(key);
                     if (currentPlayer != null && currentPlayer && PlayerFunc.IsGoalie(currentPlayer))
-                        label.text = "0.000";
+                        label.text = GetGoalieSavePerc(0, 0);
                 }
             }
         }
@@ -10259,6 +11279,57 @@ namespace oomtm450PuckMod_Stats {
             _teamTurnovers.Clear();
             _teamExits.Clear();
             _teamEntries.Clear();
+            // Wipe client team stats file when stats reset (same logic as tooltip UI reset on RESET_ALL)
+            if (_clientConfig.LogClientSideStats)
+                WriteClientTeamStatsToFile();
+        }
+
+        /// <summary>
+        /// Force-refresh tooltips and labels after a stats reset.
+        /// Tears down team tooltips and rebuilds them so they read fresh zeros from cleared dicts.
+        /// </summary>
+        private static void Client_RefreshTooltipsAndLabelsAfterReset() {
+            try {
+                HideAllPlayerTooltips();
+                int tornDown = _teamTooltips.Count;
+                // 1. Tear down existing team tooltips and hit areas
+                foreach (var kvp in new List<KeyValuePair<PlayerTeam, VisualElement>>(_teamTooltips)) {
+                    kvp.Value?.parent?.Remove(kvp.Value);
+                    _teamTooltips.Remove(kvp.Key);
+                }
+                foreach (var kvp in new List<KeyValuePair<PlayerTeam, VisualElement>>(_teamHitAreas)) {
+                    kvp.Value?.parent?.Remove(kvp.Value);
+                    _teamHitAreas.Remove(kvp.Key);
+                }
+                _teamTooltipsSetup = false;
+                _teamTooltipSetupScheduled = false;
+
+                // 2. Rebuild team tooltips - ScoreboardModifications will call SetupTeamTooltips, which creates fresh tooltips that read from (now cleared) dicts
+                ScoreboardModifications(true);
+
+                // 3. Reset player SOG/save labels on scoreboard
+                foreach (var kvp in _sogLabels) {
+                    if (kvp.Value != null) {
+                        bool isGoalie = _playerTooltipIsGoalie.TryGetValue(kvp.Key, out bool g) && g;
+                        kvp.Value.text = isGoalie ? GetGoalieSavePerc(0, 0) : "0";
+                    }
+                }
+
+                // 4. Refresh all player tooltip stat labels (entries, passes, hits, etc.) from cleared dicts
+                if (PlayerManager.Instance != null) {
+                    foreach (var kvp in new List<KeyValuePair<string, VisualElement>>(_playerTooltips)) {
+                        if (kvp.Value == null)
+                            continue;
+                        Player player = PlayerManager.Instance.GetPlayerBySteamId(kvp.Key);
+                        if (player != null && player)
+                            UpdateTooltipStats(kvp.Value, kvp.Key, player);
+                    }
+                }
+
+                Logging.Log($"RESET_ALL refresh done: tore down {tornDown} team tooltips, reset {_sogLabels.Count} player labels", _clientConfig);
+            } catch (Exception ex) {
+                Logging.LogError($"Error in Client_RefreshTooltipsAndLabelsAfterReset: {ex}", _clientConfig);
+            }
         }
         #endregion
 
@@ -10301,6 +11372,9 @@ namespace oomtm450PuckMod_Stats {
             public string PrimaryAssist { get; set; } = null;
             public string SecondaryAssist { get; set; } = null;
             public bool GWG { get; set; } = false;
+            /// <summary>Defending goalie in net when scored; empty if empty net.</summary>
+            public string DefendingGoalieSteamId { get; set; } = "";
+            public bool IsEmptyNet { get; set; } = false;
         }
 
         /// <summary>
@@ -10368,5 +11442,188 @@ namespace oomtm450PuckMod_Stats {
             Offensive    // OZ - zone with opponent's net
         }
         #endregion
+
+#if PUCK_API_DUMP
+        // =====================================================================
+        // PUCK API DUMP  — runtime reflection of all loaded game assemblies.
+        // Writes puck_api_dump.txt next to the server executable.
+        // Disable by commenting out #define PUCK_API_DUMP at the top of the file.
+        // =====================================================================
+        private static void DumpGameAPI() {
+            try {
+                var sb = new StringBuilder();
+                sb.AppendLine("=================================================================");
+                sb.AppendLine($"  PUCK API DUMP  —  generated {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} UTC");
+                sb.AppendLine("=================================================================");
+                sb.AppendLine();
+
+                // Collect every type from every loaded assembly
+                var allTypes = new List<Type>();
+                foreach (Assembly asm in AppDomain.CurrentDomain.GetAssemblies()) {
+                    try {
+                        foreach (Type t in asm.GetTypes())
+                            allTypes.Add(t);
+                    } catch (ReflectionTypeLoadException rtle) {
+                        foreach (Type t in rtle.Types)
+                            if (t != null) allTypes.Add(t);
+                    } catch { }
+                }
+
+                // ---- 1. KEY GAME TYPES (classes we interact with directly) ----
+                string[] keyNames = {
+                    "GameManager","ServerManager","PlayerManager","PuckManager","UIManager",
+                    "ChatManager","UIScoreboard","UIGameboard","UIGameState","UIChat",
+                    "UIChatController","EventManager","ModManager","NetworkManager",
+                    "Player","PlayerTeam","GameState","GamePhase","PlayByPlayEventType",
+                    "ServerConfig","ClientConfig","IPuckPlugin","IGameMode",
+                    "MonoBehaviourSingleton","NetworkBehaviourSingleton",
+                    "SystemFunc","ServerFunc","Logging","NetworkCommunication",
+                };
+
+                sb.AppendLine("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                sb.AppendLine("  SECTION 1 — KEY GAME TYPES");
+                sb.AppendLine("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                foreach (string name in keyNames) {
+                    var matches = allTypes.Where(t => t.Name == name || t.Name.StartsWith(name + "`")).ToList();
+                    foreach (Type t in matches) {
+                        sb.AppendLine();
+                        sb.AppendLine($"  [{t.FullName}]  in {t.Assembly.GetName().Name}");
+                        sb.AppendLine($"    Base: {t.BaseType?.FullName ?? "none"}");
+                        string ifaces = string.Join(", ", t.GetInterfaces().Select(i => i.Name));
+                        if (!string.IsNullOrEmpty(ifaces))
+                            sb.AppendLine($"    Interfaces: {ifaces}");
+
+                        // Fields
+                        var fields = t.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static)
+                                      .OrderBy(f => f.Name).ToList();
+                        if (fields.Count > 0) {
+                            sb.AppendLine("    FIELDS:");
+                            foreach (var f in fields)
+                                sb.AppendLine($"      {(f.IsPublic ? "pub" : f.IsPrivate ? "prv" : "prt")} {(f.IsStatic ? "static " : "")}{f.FieldType.Name} {f.Name}");
+                        }
+
+                        // Properties
+                        var props = t.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static)
+                                     .OrderBy(p => p.Name).ToList();
+                        if (props.Count > 0) {
+                            sb.AppendLine("    PROPERTIES:");
+                            foreach (var p in props)
+                                sb.AppendLine($"      {p.PropertyType.Name} {p.Name}  get={p.CanRead} set={p.CanWrite}");
+                        }
+
+                        // Methods
+                        var methods = t.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static)
+                                       .Where(m => !m.IsSpecialName)
+                                       .OrderBy(m => m.Name).ToList();
+                        if (methods.Count > 0) {
+                            sb.AppendLine("    METHODS:");
+                            foreach (var m in methods) {
+                                string parms = string.Join(", ", m.GetParameters().Select(p => $"{p.ParameterType.Name} {p.Name}"));
+                                sb.AppendLine($"      {(m.IsPublic ? "pub" : m.IsPrivate ? "prv" : "prt")} {(m.IsStatic ? "static " : "")}{m.ReturnType.Name} {m.Name}({parms})");
+                            }
+                        }
+                    }
+                }
+
+                // ---- 2. ALL HARMONY-PATCHABLE TYPES (have methods we might target) ----
+                sb.AppendLine();
+                sb.AppendLine("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                sb.AppendLine("  SECTION 2 — ALL PUBLIC TYPES IN GAME ASSEMBLIES");
+                sb.AppendLine("  (assemblies: Puck, Assembly-CSharp, Assembly-CSharp-firstpass)");
+                sb.AppendLine("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                var gameAssemblies = new HashSet<string> { "Puck", "Assembly-CSharp", "Assembly-CSharp-firstpass" };
+                var gameTypes = allTypes
+                    .Where(t => gameAssemblies.Contains(t.Assembly.GetName().Name) && t.IsPublic)
+                    .OrderBy(t => t.FullName)
+                    .ToList();
+
+                foreach (Type t in gameTypes) {
+                    sb.AppendLine();
+                    sb.AppendLine($"  [{t.FullName}]");
+                    if (t.BaseType != null && t.BaseType != typeof(object))
+                        sb.AppendLine($"    : {t.BaseType.FullName}");
+
+                    var pubMethods = t.GetMethods(BindingFlags.Public | BindingFlags.Instance | BindingFlags.Static)
+                                      .Where(m => !m.IsSpecialName).OrderBy(m => m.Name).ToList();
+                    foreach (var m in pubMethods) {
+                        string parms = string.Join(", ", m.GetParameters().Select(p => $"{p.ParameterType.Name} {p.Name}"));
+                        sb.AppendLine($"    {(m.IsStatic ? "static " : "")}{m.ReturnType.Name} {m.Name}({parms})");
+                    }
+
+                    var pubFields = t.GetFields(BindingFlags.Public | BindingFlags.Instance | BindingFlags.Static)
+                                     .OrderBy(f => f.Name).ToList();
+                    foreach (var f in pubFields)
+                        sb.AppendLine($"    field: {(f.IsStatic ? "static " : "")}{f.FieldType.Name} {f.Name}");
+                }
+
+                // ---- 3. ENUMS ----
+                sb.AppendLine();
+                sb.AppendLine("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                sb.AppendLine("  SECTION 3 — ENUMS IN GAME ASSEMBLIES");
+                sb.AppendLine("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                var enumTypes = allTypes
+                    .Where(t => gameAssemblies.Contains(t.Assembly.GetName().Name) && t.IsEnum)
+                    .OrderBy(t => t.FullName).ToList();
+                foreach (Type t in enumTypes) {
+                    sb.AppendLine($"  enum {t.FullName}: {string.Join(", ", Enum.GetNames(t))}");
+                }
+
+                // ---- 4. EVENT NAMES (EventManager listeners) ----
+                sb.AppendLine();
+                sb.AppendLine("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                sb.AppendLine("  SECTION 4 — EVENTMANAGER EVENT NAMES (via reflection)");
+                sb.AppendLine("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                try {
+                    Type emType = allTypes.FirstOrDefault(t => t.Name == "EventManager");
+                    if (emType != null) {
+                        // Try to find a dictionary of registered events
+                        var dictField = emType.GetFields(BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public)
+                            .FirstOrDefault(f => f.FieldType.IsGenericType &&
+                                f.FieldType.GetGenericTypeDefinition() == typeof(Dictionary<,>));
+                        if (dictField != null) {
+                            var dict = dictField.GetValue(null);
+                            if (dict != null) {
+                                var keys = (dict as System.Collections.IDictionary)?.Keys;
+                                if (keys != null)
+                                    foreach (var k in keys)
+                                        sb.AppendLine($"  event: {k}");
+                            }
+                        } else {
+                            sb.AppendLine("  (EventManager fields not accessible via reflection)");
+                        }
+                    }
+                } catch (Exception ex) {
+                    sb.AppendLine($"  ERROR: {ex.Message}");
+                }
+
+                // ---- 5. MOD CONFIG FIELDS ----
+                sb.AppendLine();
+                sb.AppendLine("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                sb.AppendLine("  SECTION 5 — MOD CONFIG FIELDS");
+                sb.AppendLine("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                try {
+                    Type modCfgType = allTypes.FirstOrDefault(t => t.Name == "ModConfig" || t.Name == "IModConfig");
+                    if (modCfgType != null) {
+                        foreach (var p in modCfgType.GetProperties(BindingFlags.Public | BindingFlags.Instance))
+                            sb.AppendLine($"  {p.PropertyType.Name} {p.Name}");
+                        foreach (var f in modCfgType.GetFields(BindingFlags.Public | BindingFlags.Instance))
+                            sb.AppendLine($"  field: {f.FieldType.Name} {f.Name}");
+                    } else {
+                        sb.AppendLine("  (ModConfig type not found)");
+                    }
+                } catch (Exception ex) {
+                    sb.AppendLine($"  ERROR: {ex.Message}");
+                }
+
+                // Write output
+                string outPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "puck_api_dump.txt");
+                File.WriteAllText(outPath, sb.ToString(), Encoding.UTF8);
+                Logging.Log($"API dump written to: {outPath}", ModServerConfig);
+            } catch (Exception ex) {
+                Logging.LogError($"DumpGameAPI failed: {ex}", ModServerConfig);
+            }
+        }
+#endif
+
     }
 }

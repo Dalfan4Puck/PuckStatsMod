@@ -1,0 +1,363 @@
+// =============================================================================
+// PUCK API EXPLORER - ARCHIVED
+// Removed from Stats.cs to keep the build lean.
+// To restore: paste the contents of the #region block back into Stats.cs
+// (inside the Stats class, after the last #endregion), and add the call site
+// and the header #define as shown below.
+//
+// CALL SITE (in OnEnable, after Harmony patching):
+//   #if PUCK_API_DUMP
+//       if (ServerFunc.IsDedicatedServer())
+//           DumpGameAPI();
+//   #endif
+//
+// HEADER DEFINE (top of Stats.cs, before any using statements):
+//   // #define PUCK_API_DUMP
+//
+// REQUIRED USINGS (already present in Stats.cs):
+//   using System.Reflection;
+//   using System.Text;
+// =============================================================================
+
+#if PUCK_API_DUMP
+        #region API Explorer
+        // ==================== PUCK API EXPLORER ====================
+        // Dumps a comprehensive reference file of the live game API at runtime.
+        // Run once on server enable. The output file can be fed to an AI agent
+        // to eliminate all guesswork about type names, method signatures, event
+        // strings, singleton access patterns, and NetworkVariable layouts.
+        // ============================================================
+
+        private static void DumpGameAPI() {
+            try {
+                // Locate the game assembly via a known game type.
+                Assembly gameAsm = null;
+                foreach (var asm in AppDomain.CurrentDomain.GetAssemblies()) {
+                    try {
+                        if (asm.GetType("ChatManager") != null) { gameAsm = asm; break; }
+                    }
+                    catch { }
+                }
+                if (gameAsm == null) {
+                    Logging.LogError("DumpGameAPI: Could not locate game assembly.", ModServerConfig);
+                    return;
+                }
+
+                var sb = new StringBuilder();
+                string bar = new string('=', 90);
+
+                sb.AppendLine(bar);
+                sb.AppendLine("PUCK API RUNTIME EXPLORATION DUMP");
+                sb.AppendLine($"Generated : {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} UTC");
+                sb.AppendLine($"Assembly  : {gameAsm.GetName().Name}  v{gameAsm.GetName().Version}");
+                sb.AppendLine(bar);
+
+                var allTypes = gameAsm.GetTypes()
+                    .Where(t => !t.Name.Contains("<") && !t.Name.Contains(">"))
+                    .OrderBy(t => t.FullName)
+                    .ToList();
+                var gameTypeNames = new HashSet<string>(allTypes.Select(t => t.Name));
+                sb.AppendLine($"Total non-compiler types: {allTypes.Count}");
+                sb.AppendLine();
+
+                // -- SECTION 1: SINGLETONS ------------------------------------
+                sb.AppendLine(bar);
+                sb.AppendLine("SECTION 1 — SINGLETONS  (how to access key game systems)");
+                sb.AppendLine(bar);
+                sb.AppendLine("MonoBehaviourSingleton<T>  → MonoBehaviourSingleton<T>.Instance");
+                sb.AppendLine("NetworkBehaviourSingleton<T> → NetworkBehaviourSingleton<T>.Instance");
+                sb.AppendLine();
+                foreach (var t in allTypes) {
+                    string kind = GetSingletonKind(t);
+                    if (kind == null) continue;
+                    sb.AppendLine($"  [{kind}<{t.Name}>]");
+                    DumpPublicMembers(sb, t, "    ");
+                    sb.AppendLine();
+                }
+
+                // -- SECTION 2: NETWORK VARIABLES ----------------------------
+                sb.AppendLine(bar);
+                sb.AppendLine("SECTION 2 — NETWORKBEHAVIOUR TYPES + NetworkVariable FIELDS");
+                sb.AppendLine("NetworkVariable<T> fields: read via .Value, structs expand to .Value.FieldName");
+                sb.AppendLine(bar);
+                sb.AppendLine();
+                foreach (var t in allTypes) {
+                    if (!IsSubclassOfName(t, "NetworkBehaviour")) continue;
+                    var nvFields = t.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.DeclaredOnly)
+                        .Where(f => f.FieldType.IsGenericType && f.FieldType.Name.StartsWith("NetworkVariable"))
+                        .ToList();
+                    if (nvFields.Count == 0) continue;
+                    sb.AppendLine($"  [{t.Name}]");
+                    foreach (var f in nvFields.OrderBy(f => f.Name)) {
+                        var inner = f.FieldType.GetGenericArguments().FirstOrDefault();
+                        sb.AppendLine($"    NetworkVariable<{ApiTypeName(inner)}> {f.Name}  → .{f.Name}.Value");
+                        if (inner != null && inner.IsValueType && !inner.IsPrimitive && !inner.IsEnum) {
+                            foreach (var sf in inner.GetFields(BindingFlags.Public | BindingFlags.Instance).OrderBy(sf => sf.Name))
+                                sb.AppendLine($"      .{f.Name}.Value.{sf.Name}  ({ApiTypeName(sf.FieldType)})");
+                            foreach (var sp in inner.GetProperties(BindingFlags.Public | BindingFlags.Instance).OrderBy(sp => sp.Name))
+                                sb.AppendLine($"      .{f.Name}.Value.{sp.Name}  ({ApiTypeName(sp.PropertyType)}) [prop]");
+                        }
+                    }
+                    sb.AppendLine();
+                }
+
+                // -- SECTION 3: EVENT STRINGS ---------------------------------
+                sb.AppendLine(bar);
+                sb.AppendLine("SECTION 3 — ALL Event_* METHOD NAMES (inferred listener keys)");
+                sb.AppendLine("These names appear as EventManager.AddEventListener(key, ...) strings.");
+                sb.AppendLine("'handlers in' = which game class has a method named exactly this.");
+                sb.AppendLine(bar);
+                sb.AppendLine();
+                var eventEntries = new SortedDictionary<string, List<string>>();
+                foreach (var t in allTypes) {
+                    foreach (var m in t.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static)) {
+                        if (!m.Name.StartsWith("Event_") || m.Name.Contains("<") || m.Name.Contains(">")) continue;
+                        if (!eventEntries.ContainsKey(m.Name)) eventEntries[m.Name] = new List<string>();
+                        eventEntries[m.Name].Add(t.Name);
+                    }
+                }
+                foreach (var kv in eventEntries)
+                    sb.AppendLine($"  \"{kv.Key}\"   → handlers in: {string.Join(", ", kv.Value.Distinct())}");
+                sb.AppendLine();
+
+                // -- SECTION 4: RUNTIME EVENT SUBSCRIPTIONS -------------------
+                sb.AppendLine(bar);
+                sb.AppendLine("SECTION 4 — RUNTIME EVENT SUBSCRIPTIONS (live EventManager state)");
+                sb.AppendLine("Shows which class/method is subscribed to each event key RIGHT NOW.");
+                sb.AppendLine("This is the actual wiring the game has set up at load time.");
+                sb.AppendLine(bar);
+                sb.AppendLine();
+                try {
+                    var emType = gameAsm.GetType("EventManager");
+                    if (emType != null) {
+                        var allEmFields = emType.GetFields(BindingFlags.Static | BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                        bool foundListeners = false;
+                        foreach (var emField in allEmFields) {
+                            object fieldVal = null;
+                            try { fieldVal = emField.GetValue(null); } catch { try { fieldVal = emField.GetValue(emField); } catch { } }
+                            if (fieldVal is System.Collections.IDictionary dict && dict.Count > 0) {
+                                sb.AppendLine($"  [EventManager.{emField.Name}  ({ApiTypeName(emField.FieldType)})]");
+                                var sortedKeys = new SortedDictionary<string, object>();
+                                foreach (var k in dict.Keys) {
+                                    try { sortedKeys[k.ToString()] = dict[k]; } catch { }
+                                }
+                                foreach (var kv in sortedKeys) {
+                                    sb.AppendLine($"    \"{kv.Key}\"");
+                                    if (kv.Value is System.Collections.IEnumerable sub) {
+                                        foreach (var item in sub) {
+                                            if (item is Delegate d)
+                                                sb.AppendLine($"      → {d.Method.DeclaringType?.Name}.{d.Method.Name}");
+                                            else if (item != null)
+                                                sb.AppendLine($"      → {item.GetType().Name}");
+                                        }
+                                    } else if (kv.Value is Delegate d2) {
+                                        foreach (var inv in d2.GetInvocationList())
+                                            sb.AppendLine($"      → {inv.Method.DeclaringType?.Name}.{inv.Method.Name}");
+                                    }
+                                }
+                                foundListeners = true;
+                            }
+                        }
+                        if (!foundListeners)
+                            sb.AppendLine("  (EventManager found but no accessible listener dictionary — may require instance access)");
+                    } else {
+                        sb.AppendLine("  (EventManager type not found in game assembly)");
+                    }
+                }
+                catch (Exception ex) {
+                    sb.AppendLine($"  (Section failed: {ex.Message})");
+                }
+                sb.AppendLine();
+
+                // -- SECTION 5: TYPE DEPENDENCY / COMPOSITION GRAPH -----------
+                sb.AppendLine(bar);
+                sb.AppendLine("SECTION 5 — TYPE DEPENDENCY GRAPH  (composition relationships)");
+                sb.AppendLine("Each line: TypeA depends_on TypeB, TypeC ... (has them as fields)");
+                sb.AppendLine("Reveals how systems are connected at the object level.");
+                sb.AppendLine(bar);
+                sb.AppendLine();
+                foreach (var t in allTypes.Where(t => !t.IsNested && !t.IsEnum && !t.IsInterface)) {
+                    var deps = t.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.DeclaredOnly)
+                        .SelectMany(f => ExtractGameTypeNames(f.FieldType, gameTypeNames))
+                        .Where(n => n != t.Name)
+                        .Distinct()
+                        .OrderBy(n => n)
+                        .ToList();
+                    if (deps.Count == 0) continue;
+                    sb.AppendLine($"  {t.Name,-40} depends on: {string.Join(", ", deps)}");
+                }
+                sb.AppendLine();
+
+                // -- SECTION 6: SERVER/CLIENT RPCs -----------------------------
+                sb.AppendLine(bar);
+                sb.AppendLine("SECTION 6 — SERVER_* / CLIENT_* RPCs");
+                sb.AppendLine("Server_* = server calls this, clients receive it");
+                sb.AppendLine("Client_* = client calls this, server handles it (patch these for server-side command hooks)");
+                sb.AppendLine(bar);
+                sb.AppendLine();
+                foreach (var t in allTypes) {
+                    if (!IsSubclassOfName(t, "NetworkBehaviour")) continue;
+                    var rpcs = t.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.DeclaredOnly)
+                        .Where(m => (m.Name.StartsWith("Server_") || m.Name.StartsWith("Client_")) && !m.Name.Contains("<"))
+                        .OrderBy(m => m.Name).ToList();
+                    if (rpcs.Count == 0) continue;
+                    sb.AppendLine($"  [{t.Name}]");
+                    foreach (var m in rpcs) sb.AppendLine($"    {ApiMethodSig(m)}");
+                    sb.AppendLine();
+                }
+
+                // -- SECTION 7: UIMANAGER FIELDS ------------------------------
+                sb.AppendLine(bar);
+                sb.AppendLine("SECTION 7 — UIManager public fields  (full client-side UI map)");
+                sb.AppendLine("Access: MonoBehaviourSingleton<UIManager>.Instance.<Field>");
+                sb.AppendLine(bar);
+                sb.AppendLine();
+                var uiMgr = gameAsm.GetType("UIManager");
+                if (uiMgr != null) {
+                    foreach (var f in uiMgr.GetFields(BindingFlags.Public | BindingFlags.Instance).OrderBy(f => f.Name))
+                        sb.AppendLine($"  .{f.Name,-30} ({ApiTypeName(f.FieldType)})");
+                }
+                sb.AppendLine();
+
+                // -- SECTION 8: KEY STRUCT / CLASS LAYOUTS --------------------
+                sb.AppendLine(bar);
+                sb.AppendLine("SECTION 8 — KEY TYPE LAYOUTS");
+                sb.AppendLine("ChatMessage, GameState, Server, PlayerGameState, Player — full field breakdown.");
+                sb.AppendLine(bar);
+                sb.AppendLine();
+                string[] keyTypeNames = { "ChatMessage", "GameState", "Server", "PlayerGameState", "Player" };
+                foreach (var name in keyTypeNames) {
+                    var kt = gameAsm.GetType(name);
+                    if (kt == null) continue;
+                    sb.AppendLine($"  [{kt.Name}]  ({(kt.IsValueType ? "struct" : "class")})");
+                    foreach (var f in kt.GetFields(BindingFlags.Public | BindingFlags.Instance).OrderBy(f => f.Name))
+                        sb.AppendLine($"    field  {ApiTypeName(f.FieldType),-35} {f.Name}");
+                    foreach (var p in kt.GetProperties(BindingFlags.Public | BindingFlags.Instance).OrderBy(p => p.Name))
+                        sb.AppendLine($"    prop   {ApiTypeName(p.PropertyType),-35} {p.Name}");
+                    foreach (var m in kt.GetMethods(BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly).Where(m => !m.IsSpecialName).OrderBy(m => m.Name))
+                        sb.AppendLine($"    method {ApiMethodSig(m)}");
+                    sb.AppendLine();
+                }
+
+                // -- SECTION 9: ENUMS -----------------------------------------
+                sb.AppendLine(bar);
+                sb.AppendLine("SECTION 9 — ENUMS");
+                sb.AppendLine(bar);
+                sb.AppendLine();
+                foreach (var t in allTypes.Where(t => t.IsEnum).OrderBy(t => t.Name)) {
+                    sb.AppendLine($"  [Enum: {t.Name}]");
+                    try { foreach (var val in Enum.GetValues(t)) sb.AppendLine($"    {val} = {(int)val}"); }
+                    catch { sb.AppendLine("    (could not enumerate)"); }
+                    sb.AppendLine();
+                }
+
+                // -- SECTION 10: FULL TYPE API DUMP ---------------------------
+                sb.AppendLine(bar);
+                sb.AppendLine("SECTION 10 — FULL TYPE API (all non-nested, non-compiler types)");
+                sb.AppendLine(bar);
+                sb.AppendLine();
+                foreach (var t in allTypes) {
+                    if (t.IsNested) continue;
+                    string baseStr = t.BaseType != null && t.BaseType != typeof(object) ? $" : {ApiTypeName(t.BaseType)}" : "";
+                    string kind = t.IsEnum ? "enum" : t.IsValueType ? "struct" : t.IsInterface ? "interface" : "class";
+                    sb.AppendLine($"[{kind} {t.Name}{baseStr}]");
+                    DumpPublicMembers(sb, t, "  ");
+                    sb.AppendLine();
+                }
+
+                string outputPath = Path.Combine(Path.GetFullPath("."), "puck_api_dump.txt");
+                File.WriteAllText(outputPath, sb.ToString(), Encoding.UTF8);
+                Logging.Log($"[API Dump] Written to: {outputPath}  ({sb.Length / 1024} KB)", ModServerConfig, true);
+            }
+            catch (Exception ex) {
+                Logging.LogError($"DumpGameAPI failed: {ex}", ModServerConfig);
+            }
+        }
+
+        /// <summary>
+        /// Extracts all game type names referenced by a field type, including generic arguments.
+        /// Used to build the dependency/composition graph.
+        /// </summary>
+        private static IEnumerable<string> ExtractGameTypeNames(Type t, HashSet<string> gameTypeNames) {
+            if (t == null) yield break;
+            string name = t.IsGenericType ? t.GetGenericTypeDefinition().Name : t.Name;
+            int tick = name.IndexOf('`');
+            if (tick >= 0) name = name.Substring(0, tick);
+            if (gameTypeNames.Contains(name)) yield return name;
+            if (t.IsGenericType)
+                foreach (var arg in t.GetGenericArguments())
+                    foreach (var n in ExtractGameTypeNames(arg, gameTypeNames))
+                        yield return n;
+            if (t.IsArray && t.GetElementType() != null)
+                foreach (var n in ExtractGameTypeNames(t.GetElementType(), gameTypeNames))
+                    yield return n;
+        }
+
+        private static string GetSingletonKind(Type t) {
+            var b = t.BaseType;
+            while (b != null) {
+                if (b.IsGenericType) {
+                    string n = b.GetGenericTypeDefinition().Name;
+                    if (n == "MonoBehaviourSingleton`1") return "MonoBehaviourSingleton";
+                    if (n == "NetworkBehaviourSingleton`1") return "NetworkBehaviourSingleton";
+                }
+                b = b.BaseType;
+            }
+            return null;
+        }
+
+        private static bool IsSubclassOfName(Type t, string baseName) {
+            var b = t.BaseType;
+            while (b != null) {
+                if (b.Name == baseName || (b.IsGenericType && b.GetGenericTypeDefinition().Name == baseName)) return true;
+                b = b.BaseType;
+            }
+            return false;
+        }
+
+        private static string ApiTypeName(Type t) {
+            if (t == null) return "?";
+            if (t == typeof(void)) return "void";
+            if (t == typeof(string)) return "string";
+            if (t == typeof(bool)) return "bool";
+            if (t == typeof(int)) return "int";
+            if (t == typeof(float)) return "float";
+            if (t == typeof(double)) return "double";
+            if (t == typeof(long)) return "long";
+            if (t == typeof(ulong)) return "ulong";
+            if (t.IsGenericType) {
+                string name = t.GetGenericTypeDefinition().Name;
+                name = name.Substring(0, name.IndexOf('`'));
+                string args = string.Join(", ", t.GetGenericArguments().Select(a => ApiTypeName(a)));
+                return $"{name}<{args}>";
+            }
+            return t.Name;
+        }
+
+        private static string ApiMethodSig(MethodInfo m) {
+            string parms = string.Join(", ", m.GetParameters()
+                .Select(p => {
+                    string mod = p.IsOut ? "out " : p.ParameterType.IsByRef ? "ref " : "";
+                    return $"{mod}{ApiTypeName(p.ParameterType.IsByRef ? p.ParameterType.GetElementType() : p.ParameterType)} {p.Name}";
+                }));
+            return $"{ApiTypeName(m.ReturnType)} {m.Name}({parms})";
+        }
+
+        private static void DumpPublicMembers(StringBuilder sb, Type t, string indent) {
+            var flags = BindingFlags.Public | BindingFlags.Instance | BindingFlags.Static | BindingFlags.DeclaredOnly;
+            foreach (var f in t.GetFields(flags).OrderBy(f => f.Name)) {
+                string s = f.IsStatic ? "static " : "";
+                sb.AppendLine($"{indent}field  {s}{ApiTypeName(f.FieldType)} {f.Name}");
+            }
+            foreach (var p in t.GetProperties(flags).OrderBy(p => p.Name)) {
+                string rw = $"{{ {(p.CanRead ? "get; " : "")}{(p.CanWrite ? "set; " : "")}}}";
+                sb.AppendLine($"{indent}prop   {ApiTypeName(p.PropertyType)} {p.Name} {rw}");
+            }
+            foreach (var m in t.GetMethods(flags).Where(m => !m.IsSpecialName).OrderBy(m => m.Name)) {
+                string s = m.IsStatic ? "static " : "";
+                sb.AppendLine($"{indent}method {s}{ApiMethodSig(m)}");
+            }
+        }
+        // ==================== END API EXPLORER ====================
+        #endregion
+#endif

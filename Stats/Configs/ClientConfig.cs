@@ -1,12 +1,12 @@
-﻿using Codebase;
+using Codebase;
 using Codebase.Configs;
 using Newtonsoft.Json;
 using System;
 using System.IO;
 
-namespace oomtm450PuckMod_Stats.Configs {
+namespace StatsTooltip.Configs {
     /// <summary>
-    /// Class containing the configuration from oomtm450_stats_clientconfig.json used for this mod.
+    /// Class containing the configuration from stats/dalf_stats_clientconfig.json used for this mod.
     /// </summary>
     public class ClientConfig : IConfig {
         /// <summary>
@@ -26,10 +26,10 @@ namespace oomtm450PuckMod_Stats.Configs {
         public string ModName { get; } = Constants.MOD_NAME;
 
         /// <summary>
-        /// String, full path for the config file.
+        /// String, full path for the config file (inside stats folder).
         /// </summary>
         [JsonIgnore]
-        private readonly string _configPath = Path.Combine(Path.GetFullPath("."), Constants.MOD_NAME + "_clientconfig.json");
+        private readonly string _configPath = Path.Combine(Path.GetFullPath("."), "stats", "dalf_stats_clientconfig.json");
 
         /// <summary>
         /// Function that serialize the ClientConfig object.
@@ -45,7 +45,10 @@ namespace oomtm450PuckMod_Stats.Configs {
         /// <param name="json">String, JSON that is the serialized ClientConfig.</param>
         /// <returns>ClientConfig, unserialized ClientConfig.</returns>
         internal static ClientConfig SetConfig(string json) {
-            return JsonConvert.DeserializeObject<ClientConfig>(json);
+            if (string.IsNullOrWhiteSpace(json))
+                return new ClientConfig();
+            ClientConfig parsed = JsonConvert.DeserializeObject<ClientConfig>(json);
+            return parsed ?? new ClientConfig();
         }
 
         /// <summary>
@@ -66,7 +69,8 @@ namespace oomtm450PuckMod_Stats.Configs {
                 config.Save();
             }
             catch (Exception ex) {
-                Logging.LogError($"Can't read the server config file/folder. (Permission error ?)\n{ex}", config);
+                Logging.LogError($"Can't read/write the client config file/folder. (Permission error ?)\n{ex}", config ?? new ClientConfig());
+                return config ?? new ClientConfig();
             }
 
             return config;
@@ -79,6 +83,9 @@ namespace oomtm450PuckMod_Stats.Configs {
             }
 
             try {
+                string dir = Path.GetDirectoryName(_configPath);
+                if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+                    Directory.CreateDirectory(dir);
                 File.WriteAllText(_configPath, ToString());
             }
             catch (Exception ex) {

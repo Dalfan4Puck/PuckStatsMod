@@ -1,4 +1,4 @@
-﻿using Codebase.Configs;
+using Codebase.Configs;
 using System;
 using System.Collections.Generic;
 using System.Text;
@@ -51,12 +51,21 @@ namespace Codebase {
         public static void SendData(string dataName, string dataStr, ulong clientId, string listener, IConfig config,
             NetworkDelivery networkDelivery = NetworkDelivery.ReliableFragmentedSequenced) {
             try {
+                if (dataName == null)
+                    dataName = "";
+                if (dataStr == null)
+                    dataStr = "";
+
                 byte[] data = Encoding.UTF8.GetBytes(dataStr);
-
+                // Keep original formula: 8-byte (ulong) overhead + name + payload (was added to fix memory/size issues)
                 int size = Encoding.UTF8.GetByteCount(dataName) + sizeof(ulong) + data.Length;
+                if (size <= 0 || size > 65536) {
+                    Logging.LogError($"SendData: invalid size {size}, skipping send", config);
+                    return;
+                }
 
-                FastBufferWriter writer = new FastBufferWriter(size, Allocator.TempJob);
-                writer.WriteValue(dataName);
+                FastBufferWriter writer = new FastBufferWriter(size, Allocator.Temp);
+                writer.WriteValue(dataName, oneByteChars: true); // ASCII only - matches size calc, avoids UTF-16 overflow
                 writer.WriteBytes(data);
 
                 NetworkManager.Singleton.CustomMessagingManager.SendNamedMessage(listener, clientId, writer, networkDelivery);
@@ -82,12 +91,22 @@ namespace Codebase {
         public static void SendDataToAll(string dataName, string dataStr, string listener, IConfig config,
             NetworkDelivery networkDelivery = NetworkDelivery.ReliableFragmentedSequenced) {
             try {
+                // Guard against null to prevent MemCpy segfault in FastBufferWriter
+                if (dataName == null)
+                    dataName = "";
+                if (dataStr == null)
+                    dataStr = "";
+
                 byte[] data = Encoding.UTF8.GetBytes(dataStr);
-
+                // Keep original formula: 8-byte (ulong) overhead + name + payload (was added to fix memory/size issues)
                 int size = Encoding.UTF8.GetByteCount(dataName) + sizeof(ulong) + data.Length;
+                if (size <= 0 || size > 65536) {
+                    Logging.LogError($"SendDataToAll: invalid size {size} (nameBytes + 8 + dataLen), skipping send", config);
+                    return;
+                }
 
-                FastBufferWriter writer = new FastBufferWriter(size, Allocator.TempJob);
-                writer.WriteValue(dataName);
+                FastBufferWriter writer = new FastBufferWriter(size, Allocator.Temp);
+                writer.WriteValue(dataName, oneByteChars: true); // ASCII only - matches size calc, avoids UTF-16 overflow
                 writer.WriteBytes(data);
 
                 NetworkManager.Singleton.CustomMessagingManager.SendNamedMessageToAll(listener, writer, networkDelivery);
@@ -111,7 +130,7 @@ namespace Codebase {
         /// <returns>(string DataName, string DataStr), header of the data and the content of the data.</returns>
         public static (string DataName, string DataStr) GetData(ulong clientId, FastBufferReader reader, IConfig config) {
             try {
-                reader.ReadValue(out string dataName);
+                reader.ReadValue(out string dataName, oneByteChars: true); // Must match WriteValue(oneByteChars: true)
 
                 int length = reader.Length - reader.Position;
                 int totalLength = length + sizeof(ulong) + Encoding.UTF8.GetByteCount(dataName);

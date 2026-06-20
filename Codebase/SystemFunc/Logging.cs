@@ -1,4 +1,4 @@
-﻿using Codebase.Configs;
+using Codebase.Configs;
 using UnityEngine;
 
 namespace Codebase {
@@ -14,7 +14,7 @@ namespace Codebase {
         /// <param name="bypassConfig">Bool, true to bypass the logs config. False by default.</param>
         public static void Log(string msg, IConfig config, bool bypassConfig = false) {
             if (bypassConfig || config == null || config.LogInfo)
-                Debug.Log($"[{config.ModName}] {msg}");
+                Debug.Log($"[{config?.ModName ?? "?"}] {msg}");
         }
 
         /// <summary>
@@ -23,7 +23,7 @@ namespace Codebase {
         /// <param name="msg">String, message to log.</param>
         /// <param name="config">IConfig, config to use.</param>
         public static void LogError(string msg, IConfig config) {
-            Debug.LogError($"[{config.ModName}] {msg}");
+            Debug.LogError($"[{config?.ModName ?? "?"}] {msg}");
         }
 
         /// <summary>
@@ -34,7 +34,7 @@ namespace Codebase {
         /// <param name="bypassConfig">Bool, true to bypass the logs config. False by default.</param>
         public static void LogWarning(string msg, IConfig config, bool bypassConfig = false) {
             if (bypassConfig || config == null || config.LogInfo)
-                Debug.LogWarning($"[{config.ModName}] {msg}");
+                Debug.LogWarning($"[{config?.ModName ?? "?"}] {msg}");
         }
     }
 }

@@ -12,15 +12,15 @@ To publish this mod as a client-side mod that players can download from Steam Wo
 ## Step 1: Build the Mod
 
 ```powershell
-dotnet build oomtm450PuckMod_Stats.sln --configuration Release
+dotnet build StatsTooltip.sln --configuration Release
 ```
 
-The output will be in: `Stats\bin\Release\oomtm450PuckMod_Stats.dll`
+The output will be in: `Stats\bin\Release\StatsTooltip.dll`
 
 ## Step 2: Prepare Mod Files
 
 For Steam Workshop, you need:
-- `oomtm450PuckMod_Stats.dll` (the compiled mod)
+- `StatsTooltip.dll` (the compiled mod)
 - `mod.json` (mod configuration)
 
 ### Update mod.json
@@ -43,7 +43,7 @@ Create a folder structure like this:
 
 ```
 WorkshopUpload/
-├── oomtm450PuckMod_Stats.dll
+├── StatsTooltip.dll
 └── mod.json
 ```
 
@@ -64,7 +64,7 @@ WorkshopUpload/
      - **Tags**: Add relevant tags
 
 3. **Upload Files**:
-   - Select the folder containing `oomtm450PuckMod_Stats.dll` and `mod.json`
+   - Select the folder containing `StatsTooltip.dll` and `mod.json`
    - Upload the files
    - Steam will process and publish the mod
 
@@ -124,7 +124,7 @@ This will:
 
 ### File Structure for Workshop
 The Workshop upload should contain:
-- **oomtm450PuckMod_Stats.dll** - The compiled mod (required)
+- **StatsTooltip.dll** - The compiled mod (required)
 - **mod.json** - Mod configuration (required)
 
 Do NOT include:

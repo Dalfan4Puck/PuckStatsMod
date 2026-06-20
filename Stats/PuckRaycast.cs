@@ -4,7 +4,7 @@ using System.Collections.Generic;
 using System.Linq;
 using UnityEngine;
 
-namespace oomtm450PuckMod_Stats {
+namespace StatsTooltip {
     /// <summary>
     /// Class containing code for the puck raycasts with the goal trigger to know if the puck is going towards the net or not.
     /// </summary>
